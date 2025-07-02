@@ -1,0 +1,30 @@
+[2025-07-02 19:50:14,035][PaCoDiT][INFO] - Distributed training: True
+[2025-07-02 19:50:14,035][PaCoDiT][INFO] - Set random seed to 0, deterministic: False
+[2025-07-02 19:50:14,067][PaCoDiT][INFO] - [DATASET] train set with 12964 samples, batch size: 40, shuffle: True
+[2025-07-02 19:50:14,085][PaCoDiT][INFO] - [DATASET] test set with 2375 samples, batch size: 40, shuffle: False
+[2025-07-02 19:51:03,977][PaCoDiT][INFO] - Distributed training: True
+[2025-07-02 19:51:03,978][PaCoDiT][INFO] - Set random seed to 0, deterministic: False
+[2025-07-02 19:51:04,000][PaCoDiT][INFO] - [DATASET] train set with 12964 samples, batch size: 40, shuffle: True
+[2025-07-02 19:51:04,006][PaCoDiT][INFO] - [DATASET] test set with 2375 samples, batch size: 40, shuffle: False
+[2025-07-02 19:51:05,500][PaCoDiT][INFO] - Using Distributed Data parallel ...
+[2025-07-02 19:59:01,851][PaCoDiT][INFO] - Distributed training: True
+[2025-07-02 19:59:01,852][PaCoDiT][INFO] - Set random seed to 0, deterministic: False
+[2025-07-02 19:59:01,874][PaCoDiT][INFO] - [DATASET] train set with 12964 samples, batch size: 40, shuffle: True
+[2025-07-02 19:59:01,880][PaCoDiT][INFO] - [DATASET] test set with 2375 samples, batch size: 40, shuffle: False
+[2025-07-02 19:59:03,536][PaCoDiT][INFO] - Using Distributed Data parallel ...
+[2025-07-02 20:07:58,724][PaCoDiT][INFO] - Distributed training: True
+[2025-07-02 20:07:58,724][PaCoDiT][INFO] - Set random seed to 0, deterministic: False
+[2025-07-02 20:07:58,747][PaCoDiT][INFO] - [DATASET] train set with 12964 samples, batch size: 40, shuffle: True
+[2025-07-02 20:07:58,753][PaCoDiT][INFO] - [DATASET] test set with 2375 samples, batch size: 40, shuffle: False
+[2025-07-02 20:08:00,198][PaCoDiT][INFO] - Using Distributed Data parallel ...
+[2025-07-02 20:12:04,550][PaCoDiT][INFO] - Distributed training: True
+[2025-07-02 20:12:04,550][PaCoDiT][INFO] - Set random seed to 0, deterministic: False
+[2025-07-02 20:12:04,565][PaCoDiT][INFO] - [DATASET] train set with 12964 samples, batch size: 80, shuffle: True
+[2025-07-02 20:12:04,569][PaCoDiT][INFO] - [DATASET] test set with 2375 samples, batch size: 80, shuffle: False
+[2025-07-02 20:12:05,734][PaCoDiT][INFO] - Using Distributed Data parallel ...
+[2025-07-02 20:20:40,355][PaCoDiT][INFO] - Distributed training: True
+[2025-07-02 20:20:40,356][PaCoDiT][INFO] - Set random seed to 0, deterministic: False
+[2025-07-02 20:20:40,378][PaCoDiT][INFO] - [DATASET] train set with 12964 samples, batch size: 40, shuffle: True
+[2025-07-02 20:20:40,384][PaCoDiT][INFO] - [DATASET] test set with 2375 samples, batch size: 40, shuffle: False
+[2025-07-02 20:20:41,798][PaCoDiT][INFO] - Using Distributed Data parallel ...
+[2025-07-02 20:20:58,942][PaCoDiT][INFO] - [Epoch 0/600][Batch 1/162] | BatchTime = 17.138s | Losses = [185.288, 1733.024, 582.281, 120.601, 2835.297, 69.996, 0.000] | lr = 0.000100

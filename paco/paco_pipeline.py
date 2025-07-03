@@ -1110,6 +1110,11 @@ class EnhancedPCTransformer(nn.Module):
         self.use_diffusion = getattr(config, 'use_diffusion', True)
         self.training_diffusion = True
         
+        # Dropout配置参数
+        self.feature_dropout = getattr(config, 'feature_dropout', 0.3)
+        self.mlp_dropout = getattr(config, 'mlp_dropout', 0.2)
+        self.projection_dropout = getattr(config, 'projection_dropout', 0.1)
+        
         if self.encoder_type == 'graph':
             self.grouper = DGCNN_Grouper(k=self.group_k)
             self.plane_mlp = nn.Sequential(
@@ -1122,17 +1127,20 @@ class EnhancedPCTransformer(nn.Module):
         self.pos_embed = nn.Sequential(
             nn.Linear(in_chans, 128),
             nn.GELU(),
-            nn.Linear(128, encoder.embed_dim)
+            nn.Linear(128, encoder.embed_dim),
+            nn.Dropout(self.projection_dropout)
         )
         self.plane_embed = nn.Sequential(
             nn.Linear(3, 128),
             nn.GELU(),
-            nn.Linear(128, encoder.embed_dim)
+            nn.Linear(128, encoder.embed_dim),
+            nn.Dropout(self.projection_dropout)
         )
         self.input_proj = nn.Sequential(
             nn.Linear(self.grouper.num_features, 512),
             nn.GELU(),
-            nn.Linear(512, encoder.embed_dim)
+            nn.Linear(512, encoder.embed_dim),
+            nn.Dropout(self.projection_dropout)
         )
         
         # 原始编码器
@@ -1148,22 +1156,33 @@ class EnhancedPCTransformer(nn.Module):
         self.increase_dim = nn.Sequential(
             nn.Linear(encoder.embed_dim, 1024),
             nn.GELU(),
-            nn.Linear(1024, global_feature_dim))
+            nn.Dropout(self.feature_dropout),
+            nn.Linear(1024, global_feature_dim),
+            nn.Dropout(self.feature_dropout)
+        )
             
         if self.query_type == 'dynamic':
             self.plane_pred_coarse = nn.Sequential(
                 nn.Linear(global_feature_dim, 1024),
                 nn.GELU(),
-                nn.Linear(1024, 3 * query_num))
+                nn.Dropout(self.mlp_dropout),
+                nn.Linear(1024, 3 * query_num),
+                nn.Dropout(self.projection_dropout)
+            )
             self.mlp_query = nn.Sequential(
                 nn.Linear(global_feature_dim + 3, 1024),
                 nn.GELU(),
+                nn.Dropout(self.mlp_dropout),
                 nn.Linear(1024, 1024),
                 nn.GELU(),
-                nn.Linear(1024, decoder.embed_dim))
+                nn.Dropout(self.mlp_dropout),
+                nn.Linear(1024, decoder.embed_dim),
+                nn.Dropout(self.projection_dropout)
+            )
             self.plane_pred = nn.Sequential(
                 nn.Linear(decoder.embed_dim, decoder.embed_dim // 2),
                 nn.GELU(),
+                nn.Dropout(self.projection_dropout),
                 nn.Linear(decoder.embed_dim // 2, 3)
             )
         else:
@@ -1171,14 +1190,21 @@ class EnhancedPCTransformer(nn.Module):
             self.plane_pred = nn.Sequential(
                 nn.Linear(decoder.embed_dim, decoder.embed_dim // 2),
                 nn.GELU(),
+                nn.Dropout(self.projection_dropout),
                 nn.Linear(decoder.embed_dim // 2, 3)
             )
             
         # 内存链接
         if decoder.embed_dim == encoder.embed_dim:
-            self.mem_link = nn.Identity()
+            self.mem_link = nn.Sequential(
+                nn.Identity(),
+                nn.Dropout(self.projection_dropout)
+            )
         else:
-            self.mem_link = nn.Linear(encoder.embed_dim, decoder.embed_dim)
+            self.mem_link = nn.Sequential(
+                nn.Linear(encoder.embed_dim, decoder.embed_dim),
+                nn.Dropout(self.projection_dropout)
+            )
             
         # 解码器选择：原始解码器或扩散解码器
         if self.use_diffusion:
@@ -1303,6 +1329,11 @@ class PaCoDiT(nn.Module):
         self.use_diffusion = getattr(config, 'use_diffusion', True)
         self.diffusion_loss_weight = getattr(config, 'diffusion_loss_weight', 1.0)
         
+        # Dropout配置参数
+        self.feature_dropout = getattr(config, 'feature_dropout', 0.3)
+        self.classifier_dropout = getattr(config, 'classifier_dropout', 0.5)
+        self.projection_dropout = getattr(config, 'projection_dropout', 0.1)
+        
         if self.use_diffusion:
             self.noise_scheduler = NoiseScheduler(
                 num_timesteps=getattr(config, 'num_diffusion_steps', 1000)
@@ -1331,21 +1362,31 @@ class PaCoDiT(nn.Module):
             nn.Conv1d(self.trans_dim, 1024, 1),
             nn.BatchNorm1d(1024),
             nn.LeakyReLU(negative_slope=0.2),
-            nn.Conv1d(1024, 1024, 1)
+            nn.Dropout(self.feature_dropout),
+            nn.Conv1d(1024, 1024, 1),
+            nn.Dropout(self.feature_dropout)
         )
 
-        self.reduce_map = nn.Linear(self.trans_dim + 1027, self.trans_dim)
+        self.reduce_map = nn.Sequential(
+            nn.Linear(self.trans_dim + 1027, self.trans_dim),
+            nn.Dropout(self.projection_dropout)
+        )
         hidden_dim = 256
 
         self.rebuild_map = nn.Sequential(
             nn.Conv1d(self.trans_dim, hidden_dim, 1),
             nn.BatchNorm1d(hidden_dim),
             nn.ReLU(inplace=True),
+            nn.Dropout(self.feature_dropout),
             nn.Conv1d(hidden_dim, hidden_dim // 2, 1),
             nn.BatchNorm1d(hidden_dim // 2),
             nn.ReLU(inplace=True),
+            nn.Dropout(self.feature_dropout),
         )
-        self.classifier = nn.Linear(hidden_dim // 2, 2)
+        self.classifier = nn.Sequential(
+            nn.Dropout(self.classifier_dropout),
+            nn.Linear(hidden_dim // 2, 2)
+        )
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):

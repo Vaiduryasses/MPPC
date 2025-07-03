@@ -1357,7 +1357,7 @@ class PaCoDiT(nn.Module):
             nn.init.constant_(m.weight, 1.0)
 
     def get_diffusion_loss(self, ret, gt_points, timesteps):
-        """计算扩散损失 - 修复版本"""
+        """计算扩散损失 - 使用SNR-weighted MSE损失"""
         if not self.use_diffusion:
             return {}
         
@@ -1373,8 +1373,22 @@ class PaCoDiT(nn.Module):
             noise = torch.randn_like(gt_points)
             noisy_gt = self.noise_scheduler.add_noise(gt_points, noise, timesteps)
             
-            # 计算扩散损失 - 预测的点云应该接近去噪后的真实点云
-            diffusion_loss = F.mse_loss(predicted_points, gt_points)
+            # 计算SNR-weighted MSE损失
+            # 计算基础MSE损失 (per-sample)
+            mse_loss = F.mse_loss(predicted_points, gt_points, reduction='none')  # [B, N, 3]
+            mse_loss = mse_loss.mean(dim=[1, 2])  # [B] - 每个样本的平均MSE
+            
+            # 获取SNR权重 (使用snr^0.5权重，并detach以防止梯度回传)
+            snr_weights = self.noise_scheduler.get_snr_weights(
+                timesteps, 
+                use_sqrt=True,  # 使用snr^0.5权重
+                detach_weights=True  # detach权重防止梯度回传
+            )  # [B]
+            
+            # 应用SNR权重
+            weighted_loss = snr_weights * mse_loss  # [B]
+            diffusion_loss = weighted_loss.mean()  # 标量
+            
             diffusion_loss = diffusion_loss * self.diffusion_loss_weight
             return {
                 'diffusion_loss': diffusion_loss

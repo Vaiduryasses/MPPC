@@ -52,6 +52,35 @@ class NoiseScheduler:
     def sample_timesteps(self, batch_size, device):
         """随机采样时间步"""
         return torch.randint(0, self.num_timesteps, (batch_size,), device=device)
+    
+    def get_snr_weights(self, timesteps, use_sqrt=True, detach_weights=True):
+        """计算SNR权重用于损失函数
+        
+        Args:
+            timesteps: 时间步张量
+            use_sqrt: 是否使用sqrt(SNR)权重，默认True (snr^0.5)
+            detach_weights: 是否分离权重以防止梯度回传，默认True
+            
+        Returns:
+            SNR权重张量
+        """
+        self._ensure_device(timesteps)
+        
+        # 计算SNR: alphas_cumprod[t] / (1 - alphas_cumprod[t])
+        alphas_cumprod_t = self.alphas_cumprod[timesteps]
+        snr = alphas_cumprod_t / (1.0 - alphas_cumprod_t)
+        
+        # 应用sqrt权重（snr^0.5）
+        if use_sqrt:
+            snr_weights = torch.sqrt(snr)
+        else:
+            snr_weights = snr
+        
+        # 可选的detach操作以防止梯度回传到权重
+        if detach_weights:
+            snr_weights = snr_weights.detach()
+            
+        return snr_weights
 
 
 class TimestepEmbedding(nn.Module):

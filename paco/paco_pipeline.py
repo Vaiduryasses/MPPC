@@ -1523,6 +1523,9 @@ class PaCoDiT(nn.Module):
             matched_object_class_loss = object_class_loss[hungarian_assignment[0], 0]
 
             # 计算分类损失 - 使用增强损失函数或原始方法
+            # Enhanced classification loss addresses:
+            # 1. Class imbalance (weighted CE, focal loss)
+            # 2. Gradient explosion (only matched pairs participate)
             classification_loss_type = getattr(config.loss, 'classification_loss_type', 'original')
             
             if classification_loss_type == 'enhanced':

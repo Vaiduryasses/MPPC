@@ -1522,16 +1522,47 @@ class PaCoDiT(nn.Module):
             matched_reconstructed_points = reshaped_reconstructed_points[hungarian_assignment[0]].reshape(1, -1, 3)
             matched_object_class_loss = object_class_loss[hungarian_assignment[0], 0]
 
-            # 计算未匹配分类损失
-            unmatched_indices = torch.tensor(
-                list(set(range(self.num_queries)) - set(hungarian_assignment[0].tolist())),
-                device=device
-            )
-            if len(unmatched_indices) > 0:
-                unmatched_class_loss = non_object_class_loss[unmatched_indices, 0] * config.non_obj_class_loss_weight
-                total_classification_loss = torch.cat([matched_object_class_loss, unmatched_class_loss])
+            # 计算分类损失 - 使用增强损失函数或原始方法
+            classification_loss_type = getattr(config.loss, 'classification_loss_type', 'original')
+            
+            if classification_loss_type == 'enhanced':
+                # 使用增强分类损失，仅对匹配对计算分类损失
+                from .losses import compute_enhanced_classification_loss
+                
+                loss_config = {
+                    'classification_loss_type': 'weighted_ce',
+                    'classification_loss_kwargs': getattr(config.loss, 'classification_loss_kwargs', {})
+                }
+                
+                total_classification_loss = compute_enhanced_classification_loss(
+                    classification_scores, hungarian_assignment, self.num_queries, device, loss_config
+                )
+            elif classification_loss_type in ['weighted_ce', 'focal']:
+                # 直接使用指定的损失类型
+                from .losses import compute_enhanced_classification_loss
+                
+                loss_config = {
+                    'classification_loss_type': classification_loss_type,
+                    'classification_loss_kwargs': getattr(config.loss, 'classification_loss_kwargs', {})
+                }
+                
+                total_classification_loss = compute_enhanced_classification_loss(
+                    classification_scores, hungarian_assignment, self.num_queries, device, loss_config
+                )
             else:
-                total_classification_loss = matched_object_class_loss
+                # 保持原始分类损失计算方法
+                unmatched_indices = torch.tensor(
+                    list(set(range(self.num_queries)) - set(hungarian_assignment[0].tolist())),
+                    device=device
+                )
+                if len(unmatched_indices) > 0:
+                    unmatched_class_loss = non_object_class_loss[unmatched_indices, 0] * config.non_obj_class_loss_weight
+                    total_classification_loss = torch.cat([matched_object_class_loss, unmatched_class_loss])
+                else:
+                    total_classification_loss = matched_object_class_loss
+                
+                # Convert to scalar for consistency
+                total_classification_loss = total_classification_loss.sum()
 
             # 计算精细Chamfer损失
             fine_chamfer_loss_1 = chamfer_distance(
@@ -1542,7 +1573,7 @@ class PaCoDiT(nn.Module):
             )
     
             losses["plane_chamfer_loss"] = losses["plane_chamfer_loss"] + matched_plane_chamfer_distance.sum()
-            losses["classification_loss"] = losses["classification_loss"] + total_classification_loss.sum()
+            losses["classification_loss"] = losses["classification_loss"] + total_classification_loss
             losses["plane_normal_loss"] = losses["plane_normal_loss"] + matched_plane_normal_loss.sum()
             losses["repulsion_loss"] = losses["repulsion_loss"] + matched_repulsion_penalty.sum()
             losses["chamfer_norm1_loss"] = losses["chamfer_norm1_loss"] + fine_chamfer_loss_1[0]

@@ -73,6 +73,12 @@ loss:
   plane_chamfer_loss_weight: 20
   chamfer_norm2_loss_weight: 20
   plane_normal_loss_weight: 1
+  # New enhanced classification loss settings
+  classification_loss_type: "enhanced"  # "original", "enhanced", "weighted_ce", "focal"
+  classification_loss_kwargs:
+    gamma: 2.0  # For focal loss
+    alpha: 1.0  # For focal loss
+    reduction: 'mean'
 consider_metric: total_loss
 
 # evaluation settings

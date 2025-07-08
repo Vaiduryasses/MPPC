@@ -19,6 +19,40 @@ from .diffusion_utils import (
 )
 
 
+def focal_loss(input, target, alpha=1.0, gamma=2.0, size_average=None, reduce=None, reduction='mean'):
+    """
+    Focal Loss implementation for multi-class classification.
+    
+    Args:
+        input: Tensor of shape (N, C) containing logits
+        target: Tensor of shape (N,) containing class labels
+        alpha: Weighting factor for rare class (default: 1.0)
+        gamma: Focusing parameter (default: 2.0)
+        size_average: Deprecated, use reduction instead
+        reduce: Deprecated, use reduction instead  
+        reduction: Specifies the reduction to apply to the output
+        
+    Returns:
+        Focal loss tensor
+    """
+    # Handle deprecated parameters for compatibility with F.cross_entropy interface
+    if size_average is not None or reduce is not None:
+        reduction = 'none'
+    
+    ce_loss = F.cross_entropy(input, target, reduction='none')
+    pt = torch.exp(-ce_loss)
+    focal_loss = alpha * (1 - pt) ** gamma * ce_loss
+    
+    if reduction == 'none':
+        return focal_loss
+    elif reduction == 'mean':
+        return focal_loss.mean()
+    elif reduction == 'sum':
+        return focal_loss.sum()
+    else:
+        return focal_loss
+
+
 class SelfAttnBlockAPI(nn.Module):
     r"""
     Self Attention Block API
@@ -1475,17 +1509,17 @@ class PaCoDiT(nn.Module):
             )
             plane_normal_loss = (l2_loss + cosine_loss).view(self.num_queries, num_ground_truth_planes)
 
-            # 计算分类损失
+            # 计算分类损失 - 使用Focal Loss替换交叉熵损失
             classification_scores = class_prob[batch_idx]
-            object_class_loss = F.cross_entropy(
+            object_class_loss = focal_loss(
                 classification_scores,
                 torch.zeros(self.num_queries, dtype=torch.long, device=device),
-                size_average=False, reduce=False
+                alpha=1.0, gamma=2.0, size_average=False, reduce=False
             ).unsqueeze(-1).expand(-1, num_ground_truth_planes)
-            non_object_class_loss = F.cross_entropy(
+            non_object_class_loss = focal_loss(
                 classification_scores,
                 torch.ones(self.num_queries, dtype=torch.long, device=device),
-                size_average=False, reduce=False
+                alpha=1.0, gamma=2.0, size_average=False, reduce=False
             ).unsqueeze(-1).expand(-1, num_ground_truth_planes)
 
             # 计算排斥损失

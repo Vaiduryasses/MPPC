@@ -11,8 +11,8 @@ class NoiseScheduler:
     def __init__(self, num_timesteps=1000, beta_start=0.0001, beta_end=0.02):
         self.num_timesteps = num_timesteps
         
-        # 线性噪声调度
-        self.betas = torch.linspace(beta_start, beta_end, num_timesteps)
+        # 余弦噪声调度，提供更平滑的噪声添加过程
+        self.betas = self._cosine_beta_schedule(num_timesteps, beta_start, beta_end)
         self.alphas = 1.0 - self.betas
         self.alphas_cumprod = torch.cumprod(self.alphas, dim=0)
         self.alphas_cumprod_prev = F.pad(self.alphas_cumprod[:-1], (1, 0), value=1.0)
@@ -23,6 +23,31 @@ class NoiseScheduler:
         
         # 设备标记，用于确保tensor在正确设备上
         self._device = None
+        
+    def _cosine_beta_schedule(self, num_timesteps, beta_start=0.0001, beta_end=0.02, s=0.008):
+        """
+        余弦噪声调度算法
+        
+        Args:
+            num_timesteps: 时间步数
+            beta_start: beta起始值（保持兼容性，实际调度由余弦函数决定）  
+            beta_end: beta结束值（保持兼容性，实际调度由余弦函数决定）
+            s: 偏移量，防止调度从0开始，默认0.008
+            
+        Returns:
+            betas: 余弦调度的beta值
+        """
+        timesteps = torch.arange(num_timesteps + 1, dtype=torch.float32) / num_timesteps
+        alphas_cumprod = torch.cos((timesteps + s) / (1 + s) * np.pi * 0.5) ** 2
+        alphas_cumprod = alphas_cumprod / alphas_cumprod[0]  # 归一化使alphas_cumprod[0] = 1
+        
+        # 从alphas_cumprod计算betas
+        betas = 1 - alphas_cumprod[1:] / alphas_cumprod[:-1]
+        
+        # 限制betas到合理范围以避免数值问题
+        betas = torch.clamp(betas, beta_start, 0.999)
+        
+        return betas
         
     def to(self, device):
         """将调度器参数移动到指定设备"""

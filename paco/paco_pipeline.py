@@ -1357,12 +1357,12 @@ class PaCoDiT(nn.Module):
             nn.init.constant_(m.weight, 1.0)
 
     def get_diffusion_loss(self, ret, gt_points, timesteps):
-        """计算扩散损失 - 使用SNR-weighted MSE损失"""
+        """计算扩散损失 - 基于噪声预测的SNR-weighted MSE损失"""
         if not self.use_diffusion:
             return {}
         
         try:
-            predicted_points = ret[1]  # 重建的点云
+            predicted_points = ret[1]  # 重建的点云（x0 预测）
 
             # 确保噪声调度器在正确的设备上
             device = gt_points.device
@@ -1372,10 +1372,14 @@ class PaCoDiT(nn.Module):
             # 添加噪声到目标点云
             noise = torch.randn_like(gt_points)
             noisy_gt = self.noise_scheduler.add_noise(gt_points, noise, timesteps)
-            
-            # 计算SNR-weighted MSE损失
-            # 计算基础MSE损失 (per-sample)
-            mse_loss = F.mse_loss(predicted_points, gt_points, reduction='none')  # [B, N, 3]
+
+            # 根据模型输出的 x0 预测计算噪声预测
+            sqrt_alpha = self.noise_scheduler.sqrt_alphas_cumprod[timesteps].view(-1, 1, 1)
+            sqrt_one_minus_alpha = self.noise_scheduler.sqrt_one_minus_alphas_cumprod[timesteps].view(-1, 1, 1)
+            predicted_noise = (noisy_gt - sqrt_alpha * predicted_points) / sqrt_one_minus_alpha
+
+            # 计算SNR-weighted MSE损失 (per-sample)
+            mse_loss = F.mse_loss(predicted_noise, noise, reduction='none')  # [B, N, 3]
             mse_loss = mse_loss.mean(dim=[1, 2])  # [B] - 每个样本的平均MSE
             
             # 获取SNR权重 (使用snr^0.5权重，并detach以防止梯度回传)
@@ -1413,12 +1417,13 @@ class PaCoDiT(nn.Module):
 
         device = reconstructed_points.device
         losses = {
-            "plane_chamfer_loss": 0.0,
-            "classification_loss": 0.0,
-            "chamfer_norm1_loss": 0.0,
-            "chamfer_norm2_loss": 0.0,
-            "plane_normal_loss": 0.0,
-            "repulsion_loss": 0.0
+            "plane_chamfer_loss": torch.tensor(0.0, device=device),
+            "classification_loss": torch.tensor(0.0, device=device),
+            "chamfer_norm1_loss": torch.tensor(0.0, device=device),
+            "chamfer_norm2_loss": torch.tensor(0.0, device=device),
+            "plane_normal_loss": torch.tensor(0.0, device=device),
+            "repulsion_loss": torch.tensor(0.0, device=device),
+            "diffusion_loss": torch.tensor(0.0, device=device),
         }
         
         # 添加扩散损失 - 确保在训练模式下且有有效数据时才计算
@@ -1429,7 +1434,6 @@ class PaCoDiT(nn.Module):
                 losses.update(diffusion_losses)
             except Exception as e:
                 print(f"警告：跳过扩散损失计算: {e}")
-                losses['diffusion_loss'] = torch.tensor(0.0, device=device, requires_grad=True)
         
         # ... 保持原有的损失计算逻辑不变 ...
         size_total = 0.0

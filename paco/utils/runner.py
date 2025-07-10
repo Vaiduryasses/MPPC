@@ -115,7 +115,7 @@ def run_trainer(cfg, train_writer=None, val_writer=None):
         data_time = AverageMeter()
         train_losses = AverageMeter(
             ["plane_chamfer_loss", "classification_loss", 'chamfer_norm1_loss', 'chamfer_norm2_loss',
-             "plane_normal_loss", "repulsion_loss", "total_loss"])
+             "plane_normal_loss", "repulsion_loss", "diffusion_loss", "total_loss"])
 
         num_iter = 0
 
@@ -241,7 +241,7 @@ def validate(base_model, test_dataloader, epoch, val_writer, config, logger=None
     # Initialize metrics tracking
     test_losses = AverageMeter(
         ["plane_chamfer_loss", "classification_loss", 'chamfer_norm1_loss', 'chamfer_norm2_loss', "plane_normal_loss",
-         "repulsion_loss", "total_loss"])
+         "repulsion_loss", "diffusion_loss", "total_loss"])
     n_samples = len(test_dataloader)  # bs is 1
     interval = n_samples // 10 + 1
 

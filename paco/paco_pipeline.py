@@ -1110,11 +1110,18 @@ class EnhancedPCTransformer(nn.Module):
         self.use_diffusion = getattr(config, 'use_diffusion', True)
         self.training_diffusion = True
         
+        # Dropout configuration for regularization
+        # These parameters help reduce overfitting by randomly setting some neurons to zero during training
+        self.dropout_rate = getattr(config, 'dropout_rate', 0.2)
+        self.encoder_dropout = getattr(config, 'encoder_dropout', 0.1)
+        self.decoder_dropout = getattr(config, 'decoder_dropout', 0.15)
+        
         if self.encoder_type == 'graph':
             self.grouper = DGCNN_Grouper(k=self.group_k)
             self.plane_mlp = nn.Sequential(
                 nn.Linear(encoder.embed_dim * 2, encoder.embed_dim),
-                nn.GELU()
+                nn.GELU(),
+                nn.Dropout(self.dropout_rate)  # Add dropout after activation
             )
         else:
             self.grouper = SimpleEncoder(k=self.group_k, embed_dims=128)
@@ -1122,21 +1129,27 @@ class EnhancedPCTransformer(nn.Module):
         self.pos_embed = nn.Sequential(
             nn.Linear(in_chans, 128),
             nn.GELU(),
+            nn.Dropout(self.dropout_rate),  # Add dropout in embedding layers
             nn.Linear(128, encoder.embed_dim)
         )
         self.plane_embed = nn.Sequential(
             nn.Linear(3, 128),
             nn.GELU(),
+            nn.Dropout(self.dropout_rate),  # Add dropout in embedding layers
             nn.Linear(128, encoder.embed_dim)
         )
         self.input_proj = nn.Sequential(
             nn.Linear(self.grouper.num_features, 512),
             nn.GELU(),
+            nn.Dropout(self.dropout_rate),  # Add dropout between FC layers
             nn.Linear(512, encoder.embed_dim)
         )
         
         # 原始编码器
         self.encoder = PointTransformerEncoderEntry(encoder)
+        
+        # Dropout after encoder for regularization
+        self.encoder_dropout_layer = nn.Dropout(self.encoder_dropout)
         
         # 多尺度特征提取器
         if self.use_diffusion:
@@ -1148,22 +1161,27 @@ class EnhancedPCTransformer(nn.Module):
         self.increase_dim = nn.Sequential(
             nn.Linear(encoder.embed_dim, 1024),
             nn.GELU(),
+            nn.Dropout(self.dropout_rate),  # Add dropout between FC layers
             nn.Linear(1024, global_feature_dim))
             
         if self.query_type == 'dynamic':
             self.plane_pred_coarse = nn.Sequential(
                 nn.Linear(global_feature_dim, 1024),
                 nn.GELU(),
+                nn.Dropout(self.dropout_rate),  # Add dropout between FC layers
                 nn.Linear(1024, 3 * query_num))
             self.mlp_query = nn.Sequential(
                 nn.Linear(global_feature_dim + 3, 1024),
                 nn.GELU(),
+                nn.Dropout(self.dropout_rate),  # Add dropout between FC layers
                 nn.Linear(1024, 1024),
                 nn.GELU(),
+                nn.Dropout(self.dropout_rate),  # Add dropout between FC layers
                 nn.Linear(1024, decoder.embed_dim))
             self.plane_pred = nn.Sequential(
                 nn.Linear(decoder.embed_dim, decoder.embed_dim // 2),
                 nn.GELU(),
+                nn.Dropout(self.dropout_rate),  # Add dropout before final layer
                 nn.Linear(decoder.embed_dim // 2, 3)
             )
         else:
@@ -1171,6 +1189,7 @@ class EnhancedPCTransformer(nn.Module):
             self.plane_pred = nn.Sequential(
                 nn.Linear(decoder.embed_dim, decoder.embed_dim // 2),
                 nn.GELU(),
+                nn.Dropout(self.dropout_rate),  # Add dropout before final layer
                 nn.Linear(decoder.embed_dim // 2, 3)
             )
             
@@ -1190,15 +1209,21 @@ class EnhancedPCTransformer(nn.Module):
         else:
             self.decoder = PointTransformerDecoderEntry(decoder)
             
+        # Dropout before decoder for regularization
+        self.decoder_dropout_layer = nn.Dropout(self.decoder_dropout)
+            
         if self.query_ranking:
             self.plane_mlp2 = nn.Sequential(
                 nn.Linear(encoder.embed_dim, encoder.embed_dim),
-                nn.GELU())
+                nn.GELU(),
+                nn.Dropout(self.dropout_rate))  # Add dropout after activation
             self.query_ranking = nn.Sequential(
                 nn.Linear(decoder.embed_dim, 256),
                 nn.GELU(),
+                nn.Dropout(self.dropout_rate),  # Add dropout between FC layers
                 nn.Linear(256, 256),
                 nn.GELU(),
+                nn.Dropout(self.dropout_rate),  # Add dropout between FC layers
                 nn.Linear(256, 1),
                 nn.Sigmoid()
             )
@@ -1224,6 +1249,9 @@ class EnhancedPCTransformer(nn.Module):
             x = self.multi_scale_extractor(x)
         
         x = self.encoder(x + pe, coor)
+        
+        # Apply dropout after encoder for regularization
+        x = self.encoder_dropout_layer(x)
         
         # 从点代理到平面代理
         normal_embed = self.plane_embed(normal)
@@ -1258,8 +1286,10 @@ class EnhancedPCTransformer(nn.Module):
                 
             # 使用扩散解码器或传统解码器
             if self.use_diffusion:
+                q = self.decoder_dropout_layer(q)  # Apply dropout before decoder
                 q = self.diffusion_decoder(q, timesteps, self.training_diffusion)
             else:
+                q = self.decoder_dropout_layer(q)  # Apply dropout before decoder
                 q = self.decoder(q=q, v=mem, q_pos=None, v_pos=None, denoise_length=0)
                 
             plane = self.plane_pred(q).reshape(bs, -1, 3)
@@ -1269,8 +1299,10 @@ class EnhancedPCTransformer(nn.Module):
             
             # 使用扩散解码器或传统解码器
             if self.use_diffusion:
+                q = self.decoder_dropout_layer(q)  # Apply dropout before decoder
                 q = self.diffusion_decoder(q, timesteps, self.training_diffusion)
             else:
+                q = self.decoder_dropout_layer(q)  # Apply dropout before decoder
                 q = self.decoder(q=q, v=mem, q_pos=None, v_pos=None, denoise_length=0)
                 
             plane = self.plane_pred(q).reshape(bs, -1, 3)
@@ -1294,6 +1326,11 @@ class PaCoDiT(nn.Module):
         self.num_points = getattr(config, 'num_points', None)
         self.decoder_type = config.decoder_type
         self.fold_step = 8
+        
+        # Dropout configuration for regularization
+        # Helps prevent overfitting in the reconstruction and classification tasks
+        self.dropout_rate = getattr(config, 'dropout_rate', 0.2)
+        self.classifier_dropout = getattr(config, 'classifier_dropout', 0.3)
         
         # 使用增强版Transformer
         self.base_model = EnhancedPCTransformer(config)
@@ -1331,20 +1368,27 @@ class PaCoDiT(nn.Module):
             nn.Conv1d(self.trans_dim, 1024, 1),
             nn.BatchNorm1d(1024),
             nn.LeakyReLU(negative_slope=0.2),
+            nn.Dropout(self.dropout_rate),  # Add dropout after activation
             nn.Conv1d(1024, 1024, 1)
         )
 
         self.reduce_map = nn.Linear(self.trans_dim + 1027, self.trans_dim)
+        # Add dropout layer after reduce_map
+        self.reduce_map_dropout = nn.Dropout(self.dropout_rate)
         hidden_dim = 256
 
         self.rebuild_map = nn.Sequential(
             nn.Conv1d(self.trans_dim, hidden_dim, 1),
             nn.BatchNorm1d(hidden_dim),
             nn.ReLU(inplace=True),
+            nn.Dropout(self.dropout_rate),  # Add dropout after activation
             nn.Conv1d(hidden_dim, hidden_dim // 2, 1),
             nn.BatchNorm1d(hidden_dim // 2),
             nn.ReLU(inplace=True),
+            nn.Dropout(self.dropout_rate),  # Add dropout after activation
         )
+        # Add dropout before classifier
+        self.classifier_dropout_layer = nn.Dropout(self.classifier_dropout)
         self.classifier = nn.Linear(hidden_dim // 2, 2)
 
     def _init_weights(self, m):
@@ -1606,11 +1650,15 @@ class PaCoDiT(nn.Module):
 
         if self.decoder_type == 'fold':
             rebuild_feature = self.reduce_map(rebuild_feature.reshape(B * M, -1))
+            # Apply dropout after reduce_map
+            rebuild_feature = self.reduce_map_dropout(rebuild_feature)
             angle_point = self.decode_head(rebuild_feature).reshape(B, M, 2, -1)  # B M 2 S
             theta_point = angle_point[:, :, 0, :].unsqueeze(2)
             phi_point = angle_point[:, :, 1, :].unsqueeze(2)
         else:
             rebuild_feature = self.reduce_map(rebuild_feature)
+            # Apply dropout after reduce_map
+            rebuild_feature = self.reduce_map_dropout(rebuild_feature)
             angle_point = self.decode_head(rebuild_feature)  # B M S 3
             theta_point = angle_point[:, :, :, 0]
             phi_point = angle_point[:, :, :, 1]
@@ -1642,7 +1690,9 @@ class PaCoDiT(nn.Module):
         plane = torch.cat([a.unsqueeze(-1), b.unsqueeze(-1), c.unsqueeze(-1), d.unsqueeze(-1)], dim=-1)
         ret = (plane, rebuild_points)
 
-        class_prob = self.classifier(rebuild_feature.squeeze(-1))  # B M 2
+        # Apply dropout before classifier
+        classifier_input = self.classifier_dropout_layer(rebuild_feature.squeeze(-1))
+        class_prob = self.classifier(classifier_input)  # B M 2
         class_prob = class_prob.reshape(B, M, -1)
 
         return ret, class_prob

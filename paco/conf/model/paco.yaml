@@ -17,6 +17,12 @@ diffusion_loss_weight: 1.0
 diffusion_layers: 4
 multi_scale_levels: [1, 2, 4]
 
+# Dropout configuration for regularization
+dropout_rate: 0.2          # Main dropout rate for general layers
+encoder_dropout: 0.1       # Dropout rate after encoder
+decoder_dropout: 0.15      # Dropout rate before decoder
+classifier_dropout: 0.3    # Dropout rate before classifier
+
 
 encoder: 
   embed_dim: 384

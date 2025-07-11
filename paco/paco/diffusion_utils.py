@@ -113,13 +113,13 @@ class TimestepEmbedding(nn.Module):
 
 
 class MultiScaleTokenExtractor(nn.Module):
-    """多尺度Token提取器"""
-    
-    def __init__(self, embed_dim, scales=[1, 2, 4]):
+    """多尺度Token提取器，加入跨尺度注意力"""
+
+    def __init__(self, embed_dim, scales=[1, 2, 4], num_heads=8):
         super().__init__()
         self.scales = scales
         self.embed_dim = embed_dim
-        
+
         # 为每个尺度创建特征提取器
         self.scale_extractors = nn.ModuleList([
             nn.Sequential(
@@ -129,7 +129,9 @@ class MultiScaleTokenExtractor(nn.Module):
                 nn.Conv1d(embed_dim, embed_dim, 1)
             ) for scale in scales
         ])
-        
+
+        self.cross_scale_attn = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True)
+
         # 尺度融合模块
         self.scale_fusion = nn.Sequential(
             nn.Linear(embed_dim * len(scales), embed_dim),
@@ -148,19 +150,22 @@ class MultiScaleTokenExtractor(nn.Module):
         x_transposed = x.transpose(1, 2)  # [B, C, N]
         
         scale_features = []
-        for i, extractor in enumerate(self.scale_extractors):
+        for extractor in self.scale_extractors:
             scale_feat = extractor(x_transposed)  # [B, C, N//scale]
-            
+
             # 上采样到原始尺寸
             if scale_feat.size(2) != N:
                 scale_feat = F.interpolate(scale_feat, size=N, mode='linear', align_corners=False)
-            
+
             scale_features.append(scale_feat.transpose(1, 2))  # [B, N, C]
-        
-        # 拼接所有尺度特征
-        multi_scale_feat = torch.cat(scale_features, dim=-1)  # [B, N, C*scales]
-        
-        # 融合特征
+
+        stacked = torch.stack(scale_features, dim=2)  # [B, N, S, C]
+        flat = stacked.reshape(B * N, len(self.scales), C)
+        attn_out, _ = self.cross_scale_attn(flat, flat, flat)
+        stacked = stacked + attn_out.reshape(B, N, len(self.scales), C)
+
+        multi_scale_feat = stacked.reshape(B, N, -1)
+
         fused_features = self.scale_fusion(multi_scale_feat)  # [B, N, C]
         
         return fused_features + x  # 残差连接
@@ -197,7 +202,7 @@ class LightweightDiTBlock(nn.Module):
         )
         
         # 多尺度token提取
-        self.multi_scale_extractor = MultiScaleTokenExtractor(dim)
+        self.multi_scale_extractor = MultiScaleTokenExtractor(dim, num_heads=num_heads)
         
     def forward(self, x, time_emb):
         """

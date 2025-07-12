@@ -1142,7 +1142,8 @@ class EnhancedPCTransformer(nn.Module):
         if self.use_diffusion:
             self.multi_scale_extractor = MultiScaleTokenExtractor(
                 embed_dim=encoder.embed_dim,
-                scales=getattr(config, 'multi_scale_levels', [1, 2, 4])
+                scales=getattr(config, 'multi_scale_levels', [1, 2, 4]),
+                num_heads=getattr(decoder, 'num_heads', 8)
             )
         
         self.increase_dim = nn.Sequential(

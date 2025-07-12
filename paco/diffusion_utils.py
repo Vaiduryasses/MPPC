@@ -4,6 +4,31 @@ import torch.nn.functional as F
 import numpy as np
 from typing import Optional, Tuple
 
+from .transformer_utils import (
+    Attention,
+    DeformableLocalAttention,
+    knn_point,
+)
+
+
+class CrossScaleAttention(nn.Module):
+    """跨尺度注意力，用于在不同尺度token间聚合信息"""
+
+    def __init__(self, dim, num_scales=3, num_heads=8, dropout=0.1):
+        super().__init__()
+        self.num_scales = num_scales
+        self.attn = nn.MultiheadAttention(
+            dim, num_heads, dropout=dropout, batch_first=True
+        )
+        self.norm = nn.LayerNorm(dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """x: [B, N, S, C]"""
+        B, N, S, C = x.shape
+        x_flat = x.reshape(B * N, S, C)
+        out, _ = self.attn(self.norm(x_flat), self.norm(x_flat), self.norm(x_flat))
+        return out.reshape(B, N, S, C)
+
 
 class NoiseScheduler:
     """噪声调度器，用于扩散过程"""
@@ -113,13 +138,13 @@ class TimestepEmbedding(nn.Module):
 
 
 class MultiScaleTokenExtractor(nn.Module):
-    """多尺度Token提取器"""
-    
-    def __init__(self, embed_dim, scales=[1, 2, 4]):
+    """多尺度Token提取器，加入跨尺度注意力"""
+
+    def __init__(self, embed_dim, scales=[1, 2, 4], num_heads=8):
         super().__init__()
         self.scales = scales
         self.embed_dim = embed_dim
-        
+
         # 为每个尺度创建特征提取器
         self.scale_extractors = nn.ModuleList([
             nn.Sequential(
@@ -129,7 +154,10 @@ class MultiScaleTokenExtractor(nn.Module):
                 nn.Conv1d(embed_dim, embed_dim, 1)
             ) for scale in scales
         ])
-        
+
+        # 跨尺度注意力
+        self.cross_scale_attn = CrossScaleAttention(embed_dim, num_scales=len(scales), num_heads=num_heads)
+
         # 尺度融合模块
         self.scale_fusion = nn.Sequential(
             nn.Linear(embed_dim * len(scales), embed_dim),
@@ -148,45 +176,55 @@ class MultiScaleTokenExtractor(nn.Module):
         x_transposed = x.transpose(1, 2)  # [B, C, N]
         
         scale_features = []
-        for i, extractor in enumerate(self.scale_extractors):
+        for extractor in self.scale_extractors:
             scale_feat = extractor(x_transposed)  # [B, C, N//scale]
-            
+
             # 上采样到原始尺寸
             if scale_feat.size(2) != N:
                 scale_feat = F.interpolate(scale_feat, size=N, mode='linear', align_corners=False)
-            
+
             scale_features.append(scale_feat.transpose(1, 2))  # [B, N, C]
-        
-        # 拼接所有尺度特征
-        multi_scale_feat = torch.cat(scale_features, dim=-1)  # [B, N, C*scales]
-        
+
+        # 堆叠为[B, N, S, C]
+        stacked = torch.stack(scale_features, dim=2)
+        stacked = stacked + self.cross_scale_attn(stacked)
+
+        multi_scale_feat = stacked.reshape(B, N, -1)
+
         # 融合特征
         fused_features = self.scale_fusion(multi_scale_feat)  # [B, N, C]
-        
+
         return fused_features + x  # 残差连接
 
 
 class LightweightDiTBlock(nn.Module):
-    """轻量级扩散Transformer块"""
-    
-    def __init__(self, dim, num_heads=8, mlp_ratio=4.0, dropout=0.1):
+    """轻量级扩散Transformer块，加入局部和全局注意力"""
+
+    def __init__(self, dim, num_heads=8, mlp_ratio=4.0, dropout=0.1, k=16, n_group=2):
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
-        
+
         # 时间步条件化
         self.time_mlp = nn.Sequential(
             nn.Linear(dim, dim),
             nn.GELU(),
-            nn.Linear(dim, dim * 2)  # 用于scale和shift
+            nn.Linear(dim, dim * 2)
         )
-        
-        # 自注意力
+
+        # 局部与全局注意力
         self.norm1 = nn.LayerNorm(dim)
-        self.attn = nn.MultiheadAttention(dim, num_heads, dropout=dropout, batch_first=True)
-        
-        # MLP
+        self.local_attn = DeformableLocalAttention(
+            dim, num_heads=num_heads, qkv_bias=True, attn_drop=dropout,
+            proj_drop=dropout, k=k, n_group=n_group
+        )
         self.norm2 = nn.LayerNorm(dim)
+        self.global_attn = Attention(
+            dim, num_heads=num_heads, qkv_bias=True, attn_drop=dropout, proj_drop=dropout
+        )
+
+        # MLP
+        self.norm3 = nn.LayerNorm(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = nn.Sequential(
             nn.Linear(dim, mlp_hidden_dim),
@@ -195,45 +233,42 @@ class LightweightDiTBlock(nn.Module):
             nn.Linear(mlp_hidden_dim, dim),
             nn.Dropout(dropout)
         )
-        
+
         # 多尺度token提取
-        self.multi_scale_extractor = MultiScaleTokenExtractor(dim)
-        
-    def forward(self, x, time_emb):
-        """
-        Args:
-            x: [B, N, C] 输入特征
-            time_emb: [B, C] 时间步嵌入
-        """
+        self.multi_scale_extractor = MultiScaleTokenExtractor(dim, num_heads=num_heads)
+        self.k = k
+
+    def forward(self, x, pos, time_emb):
+        """Forward pass with local then global attention."""
         B, N, C = x.shape
-        
+
         # 时间步条件化
         time_scale_shift = self.time_mlp(time_emb).view(B, 1, 2 * C)
         time_scale, time_shift = time_scale_shift.chunk(2, dim=-1)
-        
+
         # 多尺度特征提取
         x_multi_scale = self.multi_scale_extractor(x)
-        
+
         # 应用时间步条件
-        x_conditioned = x_multi_scale * (1 + time_scale) + time_shift
-        
-        # 自注意力
-        x_norm1 = self.norm1(x_conditioned)
-        attn_out, _ = self.attn(x_norm1, x_norm1, x_norm1)
-        x = x + attn_out
-        
+        x = x_multi_scale * (1 + time_scale) + time_shift
+
+        # 局部注意力
+        idx = knn_point(self.k, pos, pos)
+        x = x + self.local_attn(self.norm1(x), pos, idx=idx)
+
+        # 全局注意力
+        x = x + self.global_attn(self.norm2(x))
+
         # MLP
-        x_norm2 = self.norm2(x)
-        mlp_out = self.mlp(x_norm2)
-        x = x + mlp_out
-        
+        x = x + self.mlp(self.norm3(x))
+
         return x
 
 
 class TwoStageDiffusionModule(nn.Module):
-    """两阶段扩散模块，集成到现有decoder中"""
-    
-    def __init__(self, embed_dim, num_layers=4, num_heads=8):
+    """两阶段扩散模块，集成到现有decoder中，并加入局部注意力"""
+
+    def __init__(self, embed_dim, num_layers=4, num_heads=8, k=16, n_group=2):
         super().__init__()
         self.embed_dim = embed_dim
         self.use_diffusion = True
@@ -243,13 +278,13 @@ class TwoStageDiffusionModule(nn.Module):
         
         # 粗生成阶段
         self.coarse_layers = nn.ModuleList([
-            LightweightDiTBlock(embed_dim, num_heads) 
+            LightweightDiTBlock(embed_dim, num_heads, k=k, n_group=n_group)
             for _ in range(num_layers // 2)
         ])
         
         # 细化阶段
         self.refine_layers = nn.ModuleList([
-            LightweightDiTBlock(embed_dim, num_heads) 
+            LightweightDiTBlock(embed_dim, num_heads, k=k, n_group=n_group)
             for _ in range(num_layers // 2)
         ])
         
@@ -263,7 +298,7 @@ class TwoStageDiffusionModule(nn.Module):
         # 噪声调度器
         self.noise_scheduler = NoiseScheduler()
         
-    def forward(self, x, timesteps=None, training=True):
+    def forward(self, x, pos, timesteps=None, training=True):
         """
         Args:
             x: [B, N, C] 输入特征
@@ -285,12 +320,12 @@ class TwoStageDiffusionModule(nn.Module):
         # 粗生成阶段
         coarse_x = x
         for layer in self.coarse_layers:
-            coarse_x = layer(coarse_x, time_emb)
+            coarse_x = layer(coarse_x, pos, time_emb)
         
         # 细化阶段
         refine_x = coarse_x
         for layer in self.refine_layers:
-            refine_x = layer(refine_x, time_emb)
+            refine_x = layer(refine_x, pos, time_emb)
         
         # 阶段融合
         fused_features = torch.cat([coarse_x, refine_x], dim=-1)

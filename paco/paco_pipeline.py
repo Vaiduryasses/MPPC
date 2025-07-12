@@ -1142,7 +1142,8 @@ class EnhancedPCTransformer(nn.Module):
         if self.use_diffusion:
             self.multi_scale_extractor = MultiScaleTokenExtractor(
                 embed_dim=encoder.embed_dim,
-                scales=getattr(config, 'multi_scale_levels', [1, 2, 4])
+                scales=getattr(config, 'multi_scale_levels', [1, 2, 4]),
+                num_heads=getattr(decoder, 'num_heads', 8)
             )
         
         self.increase_dim = nn.Sequential(
@@ -1258,7 +1259,7 @@ class EnhancedPCTransformer(nn.Module):
                 
             # 使用扩散解码器或传统解码器
             if self.use_diffusion:
-                q = self.diffusion_decoder(q, timesteps, self.training_diffusion)
+                q = self.diffusion_decoder(q, plane, timesteps, self.training_diffusion)
             else:
                 q = self.decoder(q=q, v=mem, q_pos=None, v_pos=None, denoise_length=0)
                 
@@ -1269,7 +1270,8 @@ class EnhancedPCTransformer(nn.Module):
             
             # 使用扩散解码器或传统解码器
             if self.use_diffusion:
-                q = self.diffusion_decoder(q, timesteps, self.training_diffusion)
+                zero_pos = torch.zeros(bs, q.size(1), 3, device=q.device)
+                q = self.diffusion_decoder(q, zero_pos, timesteps, self.training_diffusion)
             else:
                 q = self.decoder(q=q, v=mem, q_pos=None, v_pos=None, denoise_length=0)
                 

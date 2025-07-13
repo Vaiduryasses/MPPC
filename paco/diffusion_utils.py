@@ -9,6 +9,7 @@ from .transformer_utils import (
     DeformableLocalAttention,
     knn_point,
 )
+from utils.norms import LayerNorm1d
 
 
 class CrossScaleAttention(nn.Module):
@@ -77,6 +78,10 @@ class NoiseScheduler:
     def sample_timesteps(self, batch_size, device):
         """随机采样时间步"""
         return torch.randint(0, self.num_timesteps, (batch_size,), device=device)
+
+    def ddim_timesteps(self, batch_size, device):
+        """确定性 DDIM 采样时间步"""
+        return torch.linspace(0, self.num_timesteps - 1, steps=batch_size, device=device).long()
     
     def get_snr_weights(self, timesteps, use_sqrt=True, detach_weights=True):
         """计算SNR权重用于损失函数
@@ -149,7 +154,7 @@ class MultiScaleTokenExtractor(nn.Module):
         self.scale_extractors = nn.ModuleList([
             nn.Sequential(
                 nn.Conv1d(embed_dim, embed_dim, kernel_size=scale, stride=scale, padding=0),
-                nn.BatchNorm1d(embed_dim),
+                LayerNorm1d(embed_dim),
                 nn.GELU(),
                 nn.Conv1d(embed_dim, embed_dim, 1)
             ) for scale in scales
@@ -312,7 +317,7 @@ class TwoStageDiffusionModule(nn.Module):
             if training:
                 timesteps = self.noise_scheduler.sample_timesteps(B, x.device)
             else:
-                timesteps = torch.zeros(B, dtype=torch.long, device=x.device)
+                timesteps = self.noise_scheduler.ddim_timesteps(B, x.device)
         
         # 时间步嵌入
         time_emb = self.time_embedding(timesteps)

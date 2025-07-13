@@ -70,8 +70,8 @@ class MLP(nn.Module):
     A simple MLP with configurable hidden dimension and dropout.
     """
     
-    def __init__(self, in_features: int, hidden_features: int = None, 
-                out_features: int = None, act_layer=nn.GELU, drop: float = 0.):
+    def __init__(self, in_features: int, hidden_features: int = None,
+                out_features: int = None, act_layer=nn.GELU, drop: float = 0.25):
         """Initialize MLP.
         
         Args:

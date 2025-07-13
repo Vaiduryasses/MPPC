@@ -8,6 +8,7 @@ from .transformer_utils import (
     Attention,
     DeformableLocalAttention,
     knn_point,
+    LayerNorm1d,
 )
 
 
@@ -149,7 +150,7 @@ class MultiScaleTokenExtractor(nn.Module):
         self.scale_extractors = nn.ModuleList([
             nn.Sequential(
                 nn.Conv1d(embed_dim, embed_dim, kernel_size=scale, stride=scale, padding=0),
-                nn.BatchNorm1d(embed_dim),
+                LayerNorm1d(embed_dim),
                 nn.GELU(),
                 nn.Conv1d(embed_dim, embed_dim, 1)
             ) for scale in scales
@@ -162,7 +163,9 @@ class MultiScaleTokenExtractor(nn.Module):
         self.scale_fusion = nn.Sequential(
             nn.Linear(embed_dim * len(scales), embed_dim),
             nn.GELU(),
-            nn.Linear(embed_dim, embed_dim)
+            nn.Dropout(0.25),
+            nn.Linear(embed_dim, embed_dim),
+            nn.Dropout(0.25)
         )
         
     def forward(self, x):

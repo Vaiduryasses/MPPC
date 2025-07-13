@@ -11,7 +11,7 @@ from .transformer_utils import (
     LayerScale, MLP, Attention, DeformableLocalAttention,
     DeformableLocalCrossAttention, DynamicGraphAttention,
     ImprovedDeformableLocalGraphAttention, CrossAttention,
-    knn_point, index_points
+    knn_point, index_points, LayerNorm1d
 )
 
 from .diffusion_utils import (
@@ -767,13 +767,13 @@ class Encoder(nn.Module):
         self.encoder_channel = encoder_channel
         self.first_conv = nn.Sequential(
             nn.Conv1d(3, 128, 1),
-            nn.BatchNorm1d(128),
+            LayerNorm1d(128),
             nn.ReLU(inplace=True),
             nn.Conv1d(128, 256, 1)
         )
         self.second_conv = nn.Sequential(
             nn.Conv1d(512, 512, 1),
-            nn.BatchNorm1d(512),
+            LayerNorm1d(512),
             nn.ReLU(inplace=True),
             nn.Conv1d(512, self.encoder_channel, 1)
         )
@@ -876,20 +876,20 @@ class Fold(nn.Module):
 
         self.folding1 = nn.Sequential(
             nn.Conv1d(in_channel + 2, hidden_dim, 1),
-            nn.BatchNorm1d(hidden_dim),
+            LayerNorm1d(hidden_dim),
             nn.ReLU(inplace=True),
             nn.Conv1d(hidden_dim, hidden_dim // 2, 1),
-            nn.BatchNorm1d(hidden_dim // 2),
+            LayerNorm1d(hidden_dim // 2),
             nn.ReLU(inplace=True),
             nn.Conv1d(hidden_dim // 2, self.freedom, 1)
         )
 
         self.folding2 = nn.Sequential(
             nn.Conv1d(in_channel + self.freedom, hidden_dim, 1),
-            nn.BatchNorm1d(hidden_dim),
+            LayerNorm1d(hidden_dim),
             nn.ReLU(inplace=True),
             nn.Conv1d(hidden_dim, hidden_dim // 2, 1),
-            nn.BatchNorm1d(hidden_dim // 2),
+            LayerNorm1d(hidden_dim // 2),
             nn.ReLU(inplace=True),
             nn.Conv1d(hidden_dim // 2, self.freedom, 1)
         )
@@ -977,45 +977,62 @@ class PCTransformer(nn.Module):
         self.pos_embed = nn.Sequential(
             nn.Linear(in_chans, 128),
             nn.GELU(),
-            nn.Linear(128, encoder.embed_dim)
+            nn.Dropout(0.25),
+            nn.Linear(128, encoder.embed_dim),
+            nn.Dropout(0.25)
         )
         self.plane_embed = nn.Sequential(
             nn.Linear(3, 128),
             nn.GELU(),
-            nn.Linear(128, encoder.embed_dim)
+            nn.Dropout(0.25),
+            nn.Linear(128, encoder.embed_dim),
+            nn.Dropout(0.25)
         )
         self.input_proj = nn.Sequential(
             nn.Linear(self.grouper.num_features, 512),
             nn.GELU(),
-            nn.Linear(512, encoder.embed_dim)
+            nn.Dropout(0.25),
+            nn.Linear(512, encoder.embed_dim),
+            nn.Dropout(0.25)
         )
         self.encoder = PointTransformerEncoderEntry(encoder)
         self.increase_dim = nn.Sequential(
             nn.Linear(encoder.embed_dim, 1024),
             nn.GELU(),
-            nn.Linear(1024, global_feature_dim))
+            nn.Dropout(0.25),
+            nn.Linear(1024, global_feature_dim),
+            nn.Dropout(0.25))
         if self.query_type == 'dynamic':
             self.plane_pred_coarse = nn.Sequential(
                 nn.Linear(global_feature_dim, 1024),
                 nn.GELU(),
-                nn.Linear(1024, 3 * query_num))
+                nn.Dropout(0.25),
+                nn.Linear(1024, 3 * query_num),
+                nn.Dropout(0.25))
             self.mlp_query = nn.Sequential(
                 nn.Linear(global_feature_dim + 3, 1024),
                 nn.GELU(),
+                nn.Dropout(0.25),
                 nn.Linear(1024, 1024),
                 nn.GELU(),
-                nn.Linear(1024, decoder.embed_dim))
+                nn.Dropout(0.25),
+                nn.Linear(1024, decoder.embed_dim),
+                nn.Dropout(0.25))
             self.plane_pred = nn.Sequential(
                 nn.Linear(decoder.embed_dim, decoder.embed_dim // 2),
                 nn.GELU(),
-                nn.Linear(decoder.embed_dim // 2, 3)
+                nn.Dropout(0.25),
+                nn.Linear(decoder.embed_dim // 2, 3),
+                nn.Dropout(0.25)
             )
         else:
             self.mlp_query = nn.Embedding(query_num, decoder.embed_dim)
             self.plane_pred = nn.Sequential(
                 nn.Linear(decoder.embed_dim, decoder.embed_dim // 2),
                 nn.GELU(),
-                nn.Linear(decoder.embed_dim // 2, 3)
+                nn.Dropout(0.25),
+                nn.Linear(decoder.embed_dim // 2, 3),
+                nn.Dropout(0.25)
             )
         # assert decoder.embed_dim == encoder.embed_dim
         if decoder.embed_dim == encoder.embed_dim:
@@ -1024,13 +1041,17 @@ class PCTransformer(nn.Module):
             self.mem_link = nn.Linear(encoder.embed_dim, decoder.embed_dim)
         self.decoder = PointTransformerDecoderEntry(decoder)
         if self.query_ranking:
-            self.plane_mlp2 = nn.Sequential(nn.Linear(encoder.embed_dim, encoder.embed_dim),
-                                            nn.GELU())
+            self.plane_mlp2 = nn.Sequential(
+                nn.Linear(encoder.embed_dim, encoder.embed_dim),
+                nn.GELU(),
+                nn.Dropout(0.25))
             self.query_ranking = nn.Sequential(
                 nn.Linear(decoder.embed_dim, 256),
                 nn.GELU(),
+                nn.Dropout(0.25),
                 nn.Linear(256, 256),
                 nn.GELU(),
+                nn.Dropout(0.25),
                 nn.Linear(256, 1),
                 nn.Sigmoid()
             )
@@ -1122,17 +1143,23 @@ class EnhancedPCTransformer(nn.Module):
         self.pos_embed = nn.Sequential(
             nn.Linear(in_chans, 128),
             nn.GELU(),
-            nn.Linear(128, encoder.embed_dim)
+            nn.Dropout(0.25),
+            nn.Linear(128, encoder.embed_dim),
+            nn.Dropout(0.25)
         )
         self.plane_embed = nn.Sequential(
             nn.Linear(3, 128),
             nn.GELU(),
-            nn.Linear(128, encoder.embed_dim)
+            nn.Dropout(0.25),
+            nn.Linear(128, encoder.embed_dim),
+            nn.Dropout(0.25)
         )
         self.input_proj = nn.Sequential(
             nn.Linear(self.grouper.num_features, 512),
             nn.GELU(),
-            nn.Linear(512, encoder.embed_dim)
+            nn.Dropout(0.25),
+            nn.Linear(512, encoder.embed_dim),
+            nn.Dropout(0.25)
         )
         
         # 原始编码器
@@ -1149,30 +1176,41 @@ class EnhancedPCTransformer(nn.Module):
         self.increase_dim = nn.Sequential(
             nn.Linear(encoder.embed_dim, 1024),
             nn.GELU(),
-            nn.Linear(1024, global_feature_dim))
+            nn.Dropout(0.25),
+            nn.Linear(1024, global_feature_dim),
+            nn.Dropout(0.25))
             
         if self.query_type == 'dynamic':
             self.plane_pred_coarse = nn.Sequential(
                 nn.Linear(global_feature_dim, 1024),
                 nn.GELU(),
-                nn.Linear(1024, 3 * query_num))
+                nn.Dropout(0.25),
+                nn.Linear(1024, 3 * query_num),
+                nn.Dropout(0.25))
             self.mlp_query = nn.Sequential(
                 nn.Linear(global_feature_dim + 3, 1024),
                 nn.GELU(),
+                nn.Dropout(0.25),
                 nn.Linear(1024, 1024),
                 nn.GELU(),
-                nn.Linear(1024, decoder.embed_dim))
+                nn.Dropout(0.25),
+                nn.Linear(1024, decoder.embed_dim),
+                nn.Dropout(0.25))
             self.plane_pred = nn.Sequential(
                 nn.Linear(decoder.embed_dim, decoder.embed_dim // 2),
                 nn.GELU(),
-                nn.Linear(decoder.embed_dim // 2, 3)
+                nn.Dropout(0.25),
+                nn.Linear(decoder.embed_dim // 2, 3),
+                nn.Dropout(0.25)
             )
         else:
             self.mlp_query = nn.Embedding(query_num, decoder.embed_dim)
             self.plane_pred = nn.Sequential(
                 nn.Linear(decoder.embed_dim, decoder.embed_dim // 2),
                 nn.GELU(),
-                nn.Linear(decoder.embed_dim // 2, 3)
+                nn.Dropout(0.25),
+                nn.Linear(decoder.embed_dim // 2, 3),
+                nn.Dropout(0.25)
             )
             
         # 内存链接
@@ -1194,12 +1232,15 @@ class EnhancedPCTransformer(nn.Module):
         if self.query_ranking:
             self.plane_mlp2 = nn.Sequential(
                 nn.Linear(encoder.embed_dim, encoder.embed_dim),
-                nn.GELU())
+                nn.GELU(),
+                nn.Dropout(0.25))
             self.query_ranking = nn.Sequential(
                 nn.Linear(decoder.embed_dim, 256),
                 nn.GELU(),
+                nn.Dropout(0.25),
                 nn.Linear(256, 256),
                 nn.GELU(),
+                nn.Dropout(0.25),
                 nn.Linear(256, 1),
                 nn.Sigmoid()
             )
@@ -1331,7 +1372,7 @@ class PaCoDiT(nn.Module):
 
         self.increase_dim = nn.Sequential(
             nn.Conv1d(self.trans_dim, 1024, 1),
-            nn.BatchNorm1d(1024),
+            LayerNorm1d(1024),
             nn.LeakyReLU(negative_slope=0.2),
             nn.Conv1d(1024, 1024, 1)
         )
@@ -1341,10 +1382,10 @@ class PaCoDiT(nn.Module):
 
         self.rebuild_map = nn.Sequential(
             nn.Conv1d(self.trans_dim, hidden_dim, 1),
-            nn.BatchNorm1d(hidden_dim),
+            LayerNorm1d(hidden_dim),
             nn.ReLU(inplace=True),
             nn.Conv1d(hidden_dim, hidden_dim // 2, 1),
-            nn.BatchNorm1d(hidden_dim // 2),
+            LayerNorm1d(hidden_dim // 2),
             nn.ReLU(inplace=True),
         )
         self.classifier = nn.Linear(hidden_dim // 2, 2)

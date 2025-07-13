@@ -70,8 +70,8 @@ class MLP(nn.Module):
     A simple MLP with configurable hidden dimension and dropout.
     """
     
-    def __init__(self, in_features: int, hidden_features: int = None, 
-                out_features: int = None, act_layer=nn.GELU, drop: float = 0.):
+    def __init__(self, in_features: int, hidden_features: int = None,
+                out_features: int = None, act_layer=nn.GELU, drop: float = 0.25):
         """Initialize MLP.
         
         Args:
@@ -104,6 +104,18 @@ class MLP(nn.Module):
         x = self.fc2(x)
         x = self.drop(x)
         return x
+
+
+class LayerNorm1d(nn.Module):
+    """LayerNorm for Conv1d outputs."""
+
+    def __init__(self, num_features):
+        super().__init__()
+        self.ln = nn.LayerNorm(num_features)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B, C, N] -> apply LN over C dimension
+        return self.ln(x.transpose(1, 2)).transpose(1, 2)
 
 
 class Attention(nn.Module):

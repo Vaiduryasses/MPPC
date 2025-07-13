@@ -237,6 +237,9 @@ def validate(base_model, test_dataloader, epoch, val_writer, config, logger=None
         metrics: Dictionary containing validation metrics
     """
     base_model.eval()
+    # Use deterministic DDIM sampling during validation
+    if hasattr(base_model, 'module') and hasattr(base_model.module, 'training_diffusion'):
+        base_model.module.training_diffusion = False
 
     # Initialize metrics tracking
     test_losses = AverageMeter(

@@ -13,6 +13,7 @@ from .transformer_utils import (
     ImprovedDeformableLocalGraphAttention, CrossAttention,
     knn_point, index_points, LayerNorm1d
 )
+from utils.norms import LayerNorm1d
 
 from .diffusion_utils import (
     TwoStageDiffusionModule, MultiScaleTokenExtractor, NoiseScheduler
@@ -970,7 +971,8 @@ class PCTransformer(nn.Module):
             self.grouper = DGCNN_Grouper(k=self.group_k)
             self.plane_mlp = nn.Sequential(
                 nn.Linear(encoder.embed_dim * 2, encoder.embed_dim),
-                nn.GELU()
+                nn.GELU(),
+                nn.Dropout(0.25)
             )
         else:
             self.grouper = SimpleEncoder(k=self.group_k, num_planes=self.num_planes)

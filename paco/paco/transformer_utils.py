@@ -228,6 +228,100 @@ class CrossAttention(nn.Module):
         return x
 
 
+class GeometricAwareAttention(nn.Module):
+    """GeometricAwareAttention for local attention with geometric awareness.
+    
+    This attention mechanism considers local neighborhoods and applies 
+    multi-head attention with geometric position information.
+    """
+    
+    def __init__(self, dim: int, num_heads: int = 8, qkv_bias: bool = False, 
+                qk_scale: float = None, attn_drop: float = 0., proj_drop: float = 0., 
+                k: int = 10):
+        """Initialize geometric aware attention module.
+        
+        Args:
+            dim: Input dimension
+            num_heads: Number of attention heads
+            qkv_bias: Whether to use bias in query, key, value projections
+            qk_scale: Scale factor for attention (defaults to 1/sqrt(head_dim))
+            attn_drop: Dropout rate for attention weights
+            proj_drop: Dropout rate for projection
+            k: Number of neighbors to consider
+        """
+        super().__init__()
+        self.num_heads = num_heads
+        self.dim = dim
+        self.head_dim = head_dim = dim // num_heads
+        self.scale = qk_scale or head_dim ** -0.5
+        self.k = k
+
+        self.proj_q = nn.Linear(dim, dim, bias=qkv_bias)
+        self.proj_k = nn.Linear(dim, dim, bias=qkv_bias)
+        self.proj_v = nn.Linear(dim, dim, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+    def forward(self, q: torch.Tensor, q_pos: torch.Tensor, v: torch.Tensor = None, 
+                v_pos: torch.Tensor = None, idx: torch.Tensor = None) -> torch.Tensor:
+        """Forward pass.
+        
+        Args:
+            q: Query tensor, shape [B, N, C]
+            q_pos: Query position tensor, shape [B, N, 3]
+            v: Key-value tensor, shape [B, M, C]
+            v_pos: Key-value position tensor, shape [B, M, 3]
+            idx: Optional index tensor, shape [B, N, k]
+            
+        Returns:
+            Output tensor after geometric aware attention, shape [B, N, C]
+        """
+        if v is None:
+            v = q
+        if v_pos is None:
+            v_pos = q_pos
+
+        B, N, C = q.shape
+
+        if idx is None:
+            idx = knn_point(self.k, v_pos, q_pos)  # B N k
+
+        # Project query, key, value
+        q = self.proj_q(q)  # B N C
+        k = self.proj_k(v)  # B M C  
+        v = self.proj_v(v)  # B M C
+
+        # Reshape for multi-head attention: B N C -> B N h d -> B h N d
+        q = q.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)  # B h N d
+
+        # FIXED: Proper tensor reshaping and indexing order
+        # First use index_points on the original k and v tensors (B, M, C format)
+        # Then reshape to multi-head format properly
+        local_k = index_points(k, idx)  # B, N, k, C
+        local_v = index_points(v, idx)  # B, N, k, C
+        
+        # Now reshape to multi-head format properly
+        local_k = local_k.view(B, N, self.k, self.num_heads, self.head_dim)  # B, N, k, h, d
+        local_v = local_v.view(B, N, self.k, self.num_heads, self.head_dim)  # B, N, k, h, d
+        
+        # Permute to get the correct dimension order for einsum: B, h, N, k, d
+        local_k = local_k.permute(0, 3, 1, 2, 4)  # B, h, N, k, d
+        local_v = local_v.permute(0, 3, 1, 2, 4)  # B, h, N, k, d
+
+        # Now the einsum works correctly with consistent head dimensions
+        attn = torch.einsum('bhnd,bhnkd->bhnk', q, local_k) * self.scale
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+
+        out = torch.einsum('bhnk,bhnkd->bhnd', attn, local_v)
+        out = out.transpose(1, 2).contiguous().view(B, N, C)
+        out = self.proj(out)
+        out = self.proj_drop(out)
+
+        return out
+
+
 class DeformableLocalAttention(nn.Module):
     """DeformableLocalAttention for self-attention.
     

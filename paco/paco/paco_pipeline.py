@@ -11,6 +11,7 @@ from .transformer_utils import (
     LayerScale, MLP, Attention, DeformableLocalAttention,
     DeformableLocalCrossAttention, DynamicGraphAttention,
     ImprovedDeformableLocalGraphAttention, CrossAttention,
+    GeometricAwareAttention, apply_attention_mask,
     knn_point, index_points
 )
 

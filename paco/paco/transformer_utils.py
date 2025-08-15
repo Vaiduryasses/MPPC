@@ -41,42 +41,6 @@ def apply_attention_mask(attn: torch.Tensor, mask: torch.Tensor) -> torch.Tensor
         return attn.masked_fill(mask, mask_value)
 
 
-def apply_attention_mask(attn: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    """Apply mask to attention tensor, handling both global and local attention.
-    
-    Args:
-        attn: Attention tensor, shape [B, h, N, N] for global or [B, h, N, k] for local
-        mask: Mask tensor, shape [N, N] or matching attn dimensions
-        
-    Returns:
-        Masked attention tensor of the same shape as input
-    """
-    if mask is None:
-        return attn
-        
-    mask_value = -torch.finfo(attn.dtype).max
-    mask = (mask > 0)  # convert to boolean
-    
-    # Handle both global attention [B, h, N, N] and local attention [B, h, N, k]
-    if mask.dim() == 2:  # mask is [N, N] - need to broadcast to attn dimensions
-        if attn.dim() == 4:
-            # Check if this is global attention (N x N) or local attention (N x k)
-            if attn.shape[-1] == mask.shape[-1]:  # Global attention case: [B, h, N, N]
-                mask = mask.unsqueeze(0).unsqueeze(0)  # [1, 1, N, N]
-                return attn.masked_fill(mask, mask_value)
-            else:  # Local attention case: [B, h, N, k] where k != N
-                # For local attention, we need to generate a local mask
-                # Since global mask [N, N] is incompatible with local attention [B, h, N, k],
-                # we skip masking to prevent dimension mismatch errors
-                # TODO: Implement proper local attention masking based on neighbor validity
-                return attn
-        else:
-            return attn.masked_fill(mask, mask_value)
-    else:
-        # mask already has correct dimensions, apply directly
-        return attn.masked_fill(mask, mask_value)
-
-
 def knn_point(nsample: int, xyz: torch.Tensor, new_xyz: torch.Tensor) -> torch.Tensor:
     """Find K nearest neighbors.
     

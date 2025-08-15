@@ -11,7 +11,7 @@ from .transformer_utils import (
     LayerScale, MLP, Attention, DeformableLocalAttention,
     DeformableLocalCrossAttention, DynamicGraphAttention,
     ImprovedDeformableLocalGraphAttention, CrossAttention,
-    knn_point, index_points, LayerNorm1d
+    GeometricAwareAttention, knn_point, index_points, LayerNorm1d
 )
 
 from .diffusion_utils import (
@@ -74,11 +74,16 @@ class SelfAttnBlockAPI(nn.Module):
         self.attn = None
         self.local_attn = None
         for block_token in block_tokens:
-            assert block_token in ['attn', 'rw_deform', 'deform', 'graph', 'deform_graph'], (
+            assert block_token in ['attn', 'rw_deform', 'deform', 'graph', 'deform_graph', 'geometric'], (
                 f'got unexpect block_token {block_token} for Block component'
             )
             if block_token == 'attn':
                 self.attn = Attention(
+                    dim, num_heads=num_heads, qkv_bias=qkv_bias,
+                    attn_drop=attn_drop, proj_drop=drop
+                )
+            elif block_token == 'geometric':
+                self.attn = GeometricAwareAttention(
                     dim, num_heads=num_heads, qkv_bias=qkv_bias,
                     attn_drop=attn_drop, proj_drop=drop
                 )
@@ -106,6 +111,17 @@ class SelfAttnBlockAPI(nn.Module):
                 self.ls3 = LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
                 self.drop_path3 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
 
+    def _requires_pos(self, attention_module):
+        """Check if attention module requires positional arguments.
+        
+        Args:
+            attention_module: The attention module to check
+            
+        Returns:
+            bool: True if module requires pos argument, False otherwise
+        """
+        return isinstance(attention_module, (GeometricAwareAttention,))
+
     def forward(self, x, pos, idx=None):
         """
         Forward pass for the SelfAttnBlockAPI
@@ -123,7 +139,10 @@ class SelfAttnBlockAPI(nn.Module):
             if self.combine_style == 'concat':
                 norm_x = self.norm1(x)
                 if self.attn is not None:
-                    global_attn_feat = self.attn(norm_x)
+                    if self._requires_pos(self.attn):
+                        global_attn_feat = self.attn(norm_x, pos)
+                    else:
+                        global_attn_feat = self.attn(norm_x)
                     feature_list.append(global_attn_feat)
                 if self.local_attn is not None:
                     local_attn_feat = self.local_attn(norm_x, pos, idx=idx)
@@ -136,12 +155,18 @@ class SelfAttnBlockAPI(nn.Module):
                 else:
                     raise RuntimeError()
             else:  # onebyone
-                x = x + self.drop_path1(self.ls1(self.attn(self.norm1(x))))
+                if self._requires_pos(self.attn):
+                    x = x + self.drop_path1(self.ls1(self.attn(self.norm1(x), pos)))
+                else:
+                    x = x + self.drop_path1(self.ls1(self.attn(self.norm1(x))))
                 x = x + self.drop_path3(self.ls3(self.local_attn(self.norm3(x), pos, idx=idx)))
         elif self.block_length == 1:
             norm_x = self.norm1(x)
             if self.attn is not None:
-                global_attn_feat = self.attn(norm_x)
+                if self._requires_pos(self.attn):
+                    global_attn_feat = self.attn(norm_x, pos)
+                else:
+                    global_attn_feat = self.attn(norm_x)
                 feature_list.append(global_attn_feat)
             if self.local_attn is not None:
                 local_attn_feat = self.local_attn(norm_x, pos, idx=idx)

@@ -1257,3 +1257,70 @@ class GraphConvDecoderBlock(nn.Module):
         q = q + self.drop_path2(self.ls2(self.attn(q=self.norm_q(q), v=self.norm_v(v), q_pos=q_pos, v_pos=v_pos)))
         q = q + self.drop_path3(self.ls3(self.mlp(self.norm2(q))))
         return q
+class GeometricAwareAttention(nn.Module):
+    """Geometric-aware attention that incorporates positional and normal information.
+    
+    This attention module is designed to work with geometric data by taking into account
+    the positional encoding and surface normals, making it particularly suitable for 
+    point cloud processing tasks.
+    """
+    
+    def __init__(self, dim: int, num_heads: int = 8, qkv_bias: bool = False,
+                qk_scale: float = None, attn_drop: float = 0., proj_drop: float = 0.):
+        """Initialize geometric-aware attention module.
+        
+        Args:
+            dim: Input dimension
+            num_heads: Number of attention heads
+            qkv_bias: Whether to use bias in query, key, value projections
+            qk_scale: Scale factor for attention (defaults to 1/sqrt(head_dim))
+            attn_drop: Dropout rate for attention weights
+            proj_drop: Dropout rate for projection
+        """
+        super().__init__()
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.scale = qk_scale or head_dim ** -0.5
+
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.pos_encoding = nn.Linear(3, dim)  # For positional information
+        self.normal_encoding = nn.Linear(3, dim)  # For normal information
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+    
+    def forward(self, x: torch.Tensor, pos: torch.Tensor, normal: torch.Tensor = None, idx: torch.Tensor = None) -> torch.Tensor:
+        """Compute geometric-aware attention.
+        
+        Args:
+            x: Input tensor, shape [B, N, C]
+            pos: Position tensor, shape [B, N, 3]
+            normal: Optional normal tensor, shape [B, N, 3]
+            idx: Optional index tensor (not used in this implementation)
+            
+        Returns:
+            Output tensor after geometric-aware attention, shape [B, N, C]
+        """
+        B, N, C = x.shape
+        
+        # Encode positional information
+        pos_enc = self.pos_encoding(pos)  # B, N, C
+        x_with_pos = x + pos_enc
+        
+        # Encode normal information if provided
+        if normal is not None:
+            normal_enc = self.normal_encoding(normal)  # B, N, C
+            x_with_pos = x_with_pos + normal_enc
+        
+        # Standard multi-head attention with geometric information
+        qkv = self.qkv(x_with_pos).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+
+        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x

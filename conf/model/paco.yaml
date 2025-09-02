@@ -1,0 +1,57 @@
+name: PaCo
+num_queries: 40
+num_planes: 20
+num_points: 51200
+num_centers: [128, 128]
+group_k: 32
+global_feature_dim: 1024
+
+encoder_type: graph
+decoder_type: fc
+query_type: dynamic
+query_ranking: true
+
+encoder: 
+  embed_dim: 384
+  depth: 8
+  num_heads: 6
+  k: 8
+  n_group: 2
+  mlp_ratio: 2.
+  block_style_list: ['attn-graph', 'attn', 'attn', 'attn', 'attn', 'attn', 'attn', 'attn']
+  combine_style: 'concat'
+
+decoder:
+  embed_dim: 384
+  depth: 12
+  num_heads: 6
+  k: 8
+  n_group: 2
+  mlp_ratio: 2.
+  self_attn_block_style_list: ['attn', 'attn', 'attn', 'attn', 'attn', 'attn', 'attn', 'attn', 'attn', 'attn', 'attn', 'attn']
+  self_attn_combine_style: 'concat'
+  cross_attn_block_style_list: ['attn', 'attn', 'attn', 'attn', 'attn', 'attn', 'attn', 'attn', 'attn', 'attn', 'attn', 'attn']
+  cross_attn_combine_style: 'concat'
+
+repulsion:
+  num_neighbors: 5
+  epsilon: 1e-12
+  radius: 0.07
+  kernel_bandwidth: 0.03
+use_parallel_point_path: true          # 是否启用并行点路径处理
+validation_lightweight: true           # 验证时是否使用轻量级模式
+fusion_type: "attention"               # 路径融合方式: "attention", "gating", "concat"
+point_layers: 2                        # 点处理Transformer层数（完整模式时使用）
+
+# Point path optimization settings
+point_path:
+  k_neighbors: 8                       # k-NN邻居数量（轻量级模式）
+  k_neighbors_full: 16                 # k-NN邻居数量（完整模式） 
+  multi_scale_kernels: [3, 5, 7]       # 多尺度卷积核大小
+  dropout_rate: 0.1                    # Dropout率
+  
+# Validation optimization settings  
+validation:
+  fast_inference: true                 # 验证时快速推理
+  auto_lightweight_switch: true       # 自动切换轻量级模式
+  memory_efficient: true              # 内存优化模式

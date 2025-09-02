@@ -1,4 +1,4 @@
 from utils import registry
 MODELS = registry.Registry('models')
 
-from .paco_pipeline import PaCoDiT
+from .paco_pipeline import PaCo

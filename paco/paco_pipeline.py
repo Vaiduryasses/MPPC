@@ -1,5 +1,5 @@
 from functools import partial
-
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -11,13 +11,243 @@ from .transformer_utils import (
     LayerScale, MLP, Attention, DeformableLocalAttention,
     DeformableLocalCrossAttention, DynamicGraphAttention,
     ImprovedDeformableLocalGraphAttention, CrossAttention,
-    knn_point, index_points, LayerNorm1d
+    knn_point, index_points
 )
 
-from .diffusion_utils import (
-    TwoStageDiffusionModule, MultiScaleTokenExtractor, NoiseScheduler
-)
+class PointLevelProcessor(nn.Module):
+    """
+    新增：点级别处理器 - SPVD启发的点处理分支
+    与平面代理并行工作，专注于细节特征提取
+    """
+    def __init__(self, embed_dim: int, num_layers: int = 2, use_lightweight: bool = True):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.use_lightweight = use_lightweight
+        
+        if use_lightweight:
+            # 轻量级版本 - 针对验证速度优化
+            self.point_encoder = nn.Sequential(
+                nn.Linear(embed_dim, embed_dim // 2),
+                nn.ReLU(inplace=True),
+                nn.Linear(embed_dim // 2, embed_dim),
+                nn.LayerNorm(embed_dim)
+            )
+        else:
+            # 完整版本 - 更强的表达能力
+            self.point_encoder = nn.ModuleList([
+                PointTransformerLayer(embed_dim) for _ in range(num_layers)
+            ])
+        
+        # 局部特征聚合
+        self.local_aggregator = LocalFeatureAggregation(embed_dim, k=8 if use_lightweight else 16)
+        
+        # 多尺度特征提取
+        self.multi_scale_conv = nn.ModuleList([
+            nn.Conv1d(embed_dim, embed_dim, kernel_size=k, padding=k//2, groups=max(1, embed_dim//8))
+            for k in [3, 5, 7]
+        ])
+        
+        self.scale_fusion = nn.Sequential(
+            nn.Linear(embed_dim * 3, embed_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.1)
+        )
+        
+    def forward(self, point_features: torch.Tensor, coordinates: torch.Tensor) -> torch.Tensor:
+        B, N, C = point_features.shape
+        
+        if self.use_lightweight:
+            # 轻量级处理
+            encoded_features = self.point_encoder(point_features)
+        else:
+            # 完整Transformer处理
+            encoded_features = point_features
+            for layer in self.point_encoder:
+                encoded_features = layer(encoded_features, coordinates)
+        
+        # 局部特征聚合
+        aggregated_features = self.local_aggregator(encoded_features, coordinates)
+        
+        # 多尺度特征提取
+        features_transposed = aggregated_features.transpose(1, 2)
+        
+        multi_scale_features = []
+        for conv in self.multi_scale_conv:
+            scale_feat = conv(features_transposed)
+            multi_scale_features.append(scale_feat.transpose(1, 2))
+        
+        # 融合多尺度特征
+        concatenated = torch.cat(multi_scale_features, dim=-1)
+        fused_features = self.scale_fusion(concatenated)
+        
+        return fused_features
 
+
+class LocalFeatureAggregation(nn.Module):
+    """
+    新增：局部特征聚合模块 - 基于k-NN的局部上下文提取
+    """
+    def __init__(self, feature_dim: int, k: int = 8):
+        super().__init__()
+        self.k = k
+        
+        self.edge_conv = nn.Sequential(
+            nn.Linear(feature_dim * 2, feature_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(feature_dim, feature_dim)
+        )
+        
+        self.attention = nn.MultiheadAttention(
+            embed_dim=feature_dim,
+            num_heads=8,
+            dropout=0.1,
+            batch_first=True
+        )
+        
+    def forward(self, features: torch.Tensor, coordinates: torch.Tensor) -> torch.Tensor:
+        B, N, C = features.shape
+        
+        # 计算k-NN
+        dist = torch.cdist(coordinates, coordinates)
+        _, knn_idx = torch.topk(dist, k=self.k + 1, dim=-1, largest=False)
+        knn_idx = knn_idx[:, :, 1:]  # 排除自身
+        
+        # 构建边特征
+        knn_features = torch.gather(
+            features.unsqueeze(2).expand(-1, -1, self.k, -1),
+            1,
+            knn_idx.unsqueeze(-1).expand(-1, -1, -1, C)
+        )
+        
+        center_features = features.unsqueeze(2).expand(-1, -1, self.k, -1)
+        edge_features = torch.cat([center_features, knn_features - center_features], dim=-1)
+        
+        # 边卷积
+        edge_features = self.edge_conv(edge_features)
+        
+        # 聚合
+        aggregated = torch.max(edge_features, dim=2)[0]
+        
+        # 自注意力精化
+        refined_features, _ = self.attention(aggregated, aggregated, aggregated)
+        
+        return refined_features + features  # 残差连接
+
+
+class PointTransformerLayer(nn.Module):
+    """
+    新增：点Transformer层 - 用于完整版本的点处理
+    """
+    def __init__(self, embed_dim: int, num_heads: int = 8):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        
+        self.pos_encoding = nn.Sequential(
+            nn.Linear(3, embed_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(embed_dim, embed_dim)
+        )
+        
+        self.attention = nn.MultiheadAttention(
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            dropout=0.1,
+            batch_first=True
+        )
+        
+        self.ffn = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim * 4),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.1),
+            nn.Linear(embed_dim * 4, embed_dim)
+        )
+        
+        self.norm1 = nn.LayerNorm(embed_dim)
+        self.norm2 = nn.LayerNorm(embed_dim)
+        
+    def forward(self, features: torch.Tensor, coordinates: torch.Tensor) -> torch.Tensor:
+        # 位置编码
+        pos_encoding = self.pos_encoding(coordinates)
+        features_with_pos = features + pos_encoding
+        
+        # 自注意力
+        attn_out, _ = self.attention(features_with_pos, features_with_pos, features_with_pos)
+        features = self.norm1(features + attn_out)
+        
+        # 前馈网络
+        ffn_out = self.ffn(features)
+        features = self.norm2(features + ffn_out)
+        
+        return features
+
+
+class ParallelPathFusion(nn.Module):
+    """
+    新增：并行路径融合模块 - 融合点路径和平面代理路径
+    """
+    def __init__(self, embed_dim: int, fusion_type: str = "attention"):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.fusion_type = fusion_type
+        
+        if fusion_type == "attention":
+            self.cross_attention = nn.MultiheadAttention(
+                embed_dim=embed_dim,
+                num_heads=8,
+                dropout=0.1,
+                batch_first=True
+            )
+        elif fusion_type == "gating":
+            self.gate = nn.Sequential(
+                nn.Linear(embed_dim * 2, embed_dim),
+                nn.Sigmoid()
+            )
+        elif fusion_type == "concat":
+            self.fusion_proj = nn.Sequential(
+                nn.Linear(embed_dim * 2, embed_dim * 2),
+                nn.ReLU(inplace=True),
+                nn.Linear(embed_dim * 2, embed_dim)
+            )
+        
+        # 自适应权重
+        self.adaptive_weight = nn.Sequential(
+            nn.Linear(embed_dim * 2, embed_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(embed_dim, 2),
+            nn.Softmax(dim=-1)
+        )
+        
+    def forward(self, point_features: torch.Tensor, plane_features: torch.Tensor) -> torch.Tensor:
+        if self.fusion_type == "attention":
+            # 交叉注意力融合
+            enhanced_point, _ = self.cross_attention(
+                point_features, plane_features, plane_features
+            )
+            enhanced_plane, _ = self.cross_attention(
+                plane_features, point_features, point_features
+            )
+            fused_features = (enhanced_point + enhanced_plane) / 2
+            
+        elif self.fusion_type == "gating":
+            # 门控融合
+            combined = torch.cat([point_features, plane_features], dim=-1)
+            gate = self.gate(combined)
+            fused_features = gate * point_features + (1 - gate) * plane_features
+            
+        elif self.fusion_type == "concat":
+            # 拼接融合
+            combined = torch.cat([point_features, plane_features], dim=-1)
+            fused_features = self.fusion_proj(combined)
+            
+        # 自适应权重
+        combined_for_weight = torch.cat([point_features, plane_features], dim=-1)
+        weights = self.adaptive_weight(combined_for_weight)
+        
+        final_features = (weights[:, :, 0:1] * point_features + 
+                         weights[:, :, 1:2] * plane_features)
+        
+        return final_features
 
 class SelfAttnBlockAPI(nn.Module):
     r"""
@@ -767,13 +997,13 @@ class Encoder(nn.Module):
         self.encoder_channel = encoder_channel
         self.first_conv = nn.Sequential(
             nn.Conv1d(3, 128, 1),
-            LayerNorm1d(128),
+            nn.BatchNorm1d(128),
             nn.ReLU(inplace=True),
             nn.Conv1d(128, 256, 1)
         )
         self.second_conv = nn.Sequential(
             nn.Conv1d(512, 512, 1),
-            LayerNorm1d(512),
+            nn.BatchNorm1d(512),
             nn.ReLU(inplace=True),
             nn.Conv1d(512, self.encoder_channel, 1)
         )
@@ -876,20 +1106,20 @@ class Fold(nn.Module):
 
         self.folding1 = nn.Sequential(
             nn.Conv1d(in_channel + 2, hidden_dim, 1),
-            LayerNorm1d(hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
             nn.ReLU(inplace=True),
             nn.Conv1d(hidden_dim, hidden_dim // 2, 1),
-            LayerNorm1d(hidden_dim // 2),
+            nn.BatchNorm1d(hidden_dim // 2),
             nn.ReLU(inplace=True),
             nn.Conv1d(hidden_dim // 2, self.freedom, 1)
         )
 
         self.folding2 = nn.Sequential(
             nn.Conv1d(in_channel + self.freedom, hidden_dim, 1),
-            LayerNorm1d(hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
             nn.ReLU(inplace=True),
             nn.Conv1d(hidden_dim, hidden_dim // 2, 1),
-            LayerNorm1d(hidden_dim // 2),
+            nn.BatchNorm1d(hidden_dim // 2),
             nn.ReLU(inplace=True),
             nn.Conv1d(hidden_dim // 2, self.freedom, 1)
         )
@@ -966,6 +1196,10 @@ class PCTransformer(nn.Module):
         self.num_queries = config.num_queries
         query_num = config.num_queries
         global_feature_dim = config.global_feature_dim
+        self.use_parallel_point_path = getattr(config, 'use_parallel_point_path', True)
+        self.validation_lightweight = getattr(config, 'validation_lightweight', True)
+        self.fusion_type = getattr(config, 'fusion_type', 'attention')
+
         if self.encoder_type == 'graph':
             self.grouper = DGCNN_Grouper(k=self.group_k)
             self.plane_mlp = nn.Sequential(
@@ -977,62 +1211,58 @@ class PCTransformer(nn.Module):
         self.pos_embed = nn.Sequential(
             nn.Linear(in_chans, 128),
             nn.GELU(),
-            nn.Dropout(0.25),
-            nn.Linear(128, encoder.embed_dim),
-            nn.Dropout(0.25)
+            nn.Linear(128, encoder.embed_dim)
         )
         self.plane_embed = nn.Sequential(
             nn.Linear(3, 128),
             nn.GELU(),
-            nn.Dropout(0.25),
-            nn.Linear(128, encoder.embed_dim),
-            nn.Dropout(0.25)
+            nn.Linear(128, encoder.embed_dim)
         )
         self.input_proj = nn.Sequential(
             nn.Linear(self.grouper.num_features, 512),
             nn.GELU(),
-            nn.Dropout(0.25),
-            nn.Linear(512, encoder.embed_dim),
-            nn.Dropout(0.25)
+            nn.Linear(512, encoder.embed_dim)
         )
         self.encoder = PointTransformerEncoderEntry(encoder)
         self.increase_dim = nn.Sequential(
             nn.Linear(encoder.embed_dim, 1024),
             nn.GELU(),
-            nn.Dropout(0.25),
-            nn.Linear(1024, global_feature_dim),
-            nn.Dropout(0.25))
+            nn.Linear(1024, global_feature_dim))
+        if self.use_parallel_point_path:
+            self.point_processor = PointLevelProcessor(
+                embed_dim=encoder.embed_dim,
+                num_layers=getattr(config, 'point_layers', 2),
+                use_lightweight=self.validation_lightweight
+            )
+            
+            # 并行路径融合
+            self.path_fusion = ParallelPathFusion(
+                embed_dim=encoder.embed_dim,
+                fusion_type=self.fusion_type
+            )
+
         if self.query_type == 'dynamic':
             self.plane_pred_coarse = nn.Sequential(
                 nn.Linear(global_feature_dim, 1024),
                 nn.GELU(),
-                nn.Dropout(0.25),
-                nn.Linear(1024, 3 * query_num),
-                nn.Dropout(0.25))
+                nn.Linear(1024, 3 * query_num))
             self.mlp_query = nn.Sequential(
                 nn.Linear(global_feature_dim + 3, 1024),
                 nn.GELU(),
-                nn.Dropout(0.25),
                 nn.Linear(1024, 1024),
                 nn.GELU(),
-                nn.Dropout(0.25),
-                nn.Linear(1024, decoder.embed_dim),
-                nn.Dropout(0.25))
+                nn.Linear(1024, decoder.embed_dim))
             self.plane_pred = nn.Sequential(
                 nn.Linear(decoder.embed_dim, decoder.embed_dim // 2),
                 nn.GELU(),
-                nn.Dropout(0.25),
-                nn.Linear(decoder.embed_dim // 2, 3),
-                nn.Dropout(0.25)
+                nn.Linear(decoder.embed_dim // 2, 3)
             )
         else:
             self.mlp_query = nn.Embedding(query_num, decoder.embed_dim)
             self.plane_pred = nn.Sequential(
                 nn.Linear(decoder.embed_dim, decoder.embed_dim // 2),
                 nn.GELU(),
-                nn.Dropout(0.25),
-                nn.Linear(decoder.embed_dim // 2, 3),
-                nn.Dropout(0.25)
+                nn.Linear(decoder.embed_dim // 2, 3)
             )
         # assert decoder.embed_dim == encoder.embed_dim
         if decoder.embed_dim == encoder.embed_dim:
@@ -1041,17 +1271,13 @@ class PCTransformer(nn.Module):
             self.mem_link = nn.Linear(encoder.embed_dim, decoder.embed_dim)
         self.decoder = PointTransformerDecoderEntry(decoder)
         if self.query_ranking:
-            self.plane_mlp2 = nn.Sequential(
-                nn.Linear(encoder.embed_dim, encoder.embed_dim),
-                nn.GELU(),
-                nn.Dropout(0.25))
+            self.plane_mlp2 = nn.Sequential(nn.Linear(encoder.embed_dim, encoder.embed_dim),
+                                            nn.GELU())
             self.query_ranking = nn.Sequential(
                 nn.Linear(decoder.embed_dim, 256),
                 nn.GELU(),
-                nn.Dropout(0.25),
                 nn.Linear(256, 256),
                 nn.GELU(),
-                nn.Dropout(0.25),
                 nn.Linear(256, 1),
                 nn.Sigmoid()
             )
@@ -1072,6 +1298,11 @@ class PCTransformer(nn.Module):
         pe = self.pos_embed(coor)
         x = self.input_proj(f)
         x = self.encoder(x + pe, coor)
+        # 新增：点级别处理路径
+        if self.use_parallel_point_path:
+           # 点路径处理
+            point_enhanced_features = self.point_processor(x, coor)
+
         # from point proxy to plane proxy
         normal_embed = self.plane_embed(normal)
         x = torch.cat([x, normal_embed], dim=-1)
@@ -1081,6 +1312,21 @@ class PCTransformer(nn.Module):
             for j, ub in enumerate(unique_batch):
                 plane_encoder[i][j] = x[i][(batch[i] == ub).squeeze()].sum(dim=0)
         x = self.plane_mlp(plane_encoder)
+        if self.use_parallel_point_path:
+            # 将平面特征广播到点级别进行融合
+            aligned_plane_features = torch.zeros_like(point_enhanced_features)
+            for i in range(bs):
+                unique_batch = torch.unique(batch[i])
+                for j, ub in enumerate(unique_batch):
+                    mask = (batch[i] == ub).squeeze()
+                    if j < x.size(1):
+                        aligned_plane_features[i][mask] = x[i][j]
+            
+            # 融合点路径和平面路径特征
+            fused_features = self.path_fusion(point_enhanced_features, aligned_plane_features)
+            
+            # 更新x用于后续处理
+            x = fused_features
         global_feature = self.increase_dim(x)  # B 1024 N
         global_feature = torch.max(global_feature, dim=1)[0]  # B 1024
         mem = self.mem_link(x)
@@ -1109,225 +1355,14 @@ class PCTransformer(nn.Module):
             plane = self.plane_pred(q).reshape(bs, -1, 3)
         return q, plane
 
-class EnhancedPCTransformer(nn.Module):
-    """增强版PCTransformer，集成多尺度token和扩散机制"""
-    
-    def __init__(self, config):
-        super().__init__()
-        encoder = config.encoder
-        decoder = config.decoder
-        self.num_centers = getattr(config, 'num_centers', [512, 128])
-        self.num_planes = getattr(config, 'num_planes', 20)
-        self.group_k = getattr(config, 'group_k', 32)
-        self.query_ranking = getattr(config, 'query_ranking', False)
-        self.encoder_type = config.encoder_type
-        self.query_type = config.query_type
-        in_chans = 3
-        self.num_queries = config.num_queries
-        query_num = config.num_queries
-        global_feature_dim = config.global_feature_dim
-        
-        # 扩散相关配置
-        self.use_diffusion = getattr(config, 'use_diffusion', True)
-        self.training_diffusion = True
-        
-        if self.encoder_type == 'graph':
-            self.grouper = DGCNN_Grouper(k=self.group_k)
-            self.plane_mlp = nn.Sequential(
-                nn.Linear(encoder.embed_dim * 2, encoder.embed_dim),
-                nn.GELU()
-            )
-        else:
-            self.grouper = SimpleEncoder(k=self.group_k, embed_dims=128)
-            
-        self.pos_embed = nn.Sequential(
-            nn.Linear(in_chans, 128),
-            nn.GELU(),
-            nn.Dropout(0.25),
-            nn.Linear(128, encoder.embed_dim),
-            nn.Dropout(0.25)
-        )
-        self.plane_embed = nn.Sequential(
-            nn.Linear(3, 128),
-            nn.GELU(),
-            nn.Dropout(0.25),
-            nn.Linear(128, encoder.embed_dim),
-            nn.Dropout(0.25)
-        )
-        self.input_proj = nn.Sequential(
-            nn.Linear(self.grouper.num_features, 512),
-            nn.GELU(),
-            nn.Dropout(0.25),
-            nn.Linear(512, encoder.embed_dim),
-            nn.Dropout(0.25)
-        )
-        
-        # 原始编码器
-        self.encoder = PointTransformerEncoderEntry(encoder)
-        
-        # 多尺度特征提取器
-        if self.use_diffusion:
-            self.multi_scale_extractor = MultiScaleTokenExtractor(
-                embed_dim=encoder.embed_dim,
-                scales=getattr(config, 'multi_scale_levels', [1, 2, 4]),
-                num_heads=getattr(decoder, 'num_heads', 8)
-            )
-        
-        self.increase_dim = nn.Sequential(
-            nn.Linear(encoder.embed_dim, 1024),
-            nn.GELU(),
-            nn.Dropout(0.25),
-            nn.Linear(1024, global_feature_dim),
-            nn.Dropout(0.25))
-            
-        if self.query_type == 'dynamic':
-            self.plane_pred_coarse = nn.Sequential(
-                nn.Linear(global_feature_dim, 1024),
-                nn.GELU(),
-                nn.Dropout(0.25),
-                nn.Linear(1024, 3 * query_num),
-                nn.Dropout(0.25))
-            self.mlp_query = nn.Sequential(
-                nn.Linear(global_feature_dim + 3, 1024),
-                nn.GELU(),
-                nn.Dropout(0.25),
-                nn.Linear(1024, 1024),
-                nn.GELU(),
-                nn.Dropout(0.25),
-                nn.Linear(1024, decoder.embed_dim),
-                nn.Dropout(0.25))
-            self.plane_pred = nn.Sequential(
-                nn.Linear(decoder.embed_dim, decoder.embed_dim // 2),
-                nn.GELU(),
-                nn.Dropout(0.25),
-                nn.Linear(decoder.embed_dim // 2, 3),
-                nn.Dropout(0.25)
-            )
-        else:
-            self.mlp_query = nn.Embedding(query_num, decoder.embed_dim)
-            self.plane_pred = nn.Sequential(
-                nn.Linear(decoder.embed_dim, decoder.embed_dim // 2),
-                nn.GELU(),
-                nn.Dropout(0.25),
-                nn.Linear(decoder.embed_dim // 2, 3),
-                nn.Dropout(0.25)
-            )
-            
-        # 内存链接
-        if decoder.embed_dim == encoder.embed_dim:
-            self.mem_link = nn.Identity()
-        else:
-            self.mem_link = nn.Linear(encoder.embed_dim, decoder.embed_dim)
-            
-        # 解码器选择：原始解码器或扩散解码器
-        if self.use_diffusion:
-            self.diffusion_decoder = TwoStageDiffusionModule(
-                embed_dim=decoder.embed_dim,
-                num_layers=getattr(config, 'diffusion_layers', 4),
-                num_heads=getattr(decoder, 'num_heads', 8)
-            )
-        else:
-            self.decoder = PointTransformerDecoderEntry(decoder)
-            
-        if self.query_ranking:
-            self.plane_mlp2 = nn.Sequential(
-                nn.Linear(encoder.embed_dim, encoder.embed_dim),
-                nn.GELU(),
-                nn.Dropout(0.25))
-            self.query_ranking = nn.Sequential(
-                nn.Linear(decoder.embed_dim, 256),
-                nn.GELU(),
-                nn.Dropout(0.25),
-                nn.Linear(256, 256),
-                nn.GELU(),
-                nn.Dropout(0.25),
-                nn.Linear(256, 1),
-                nn.Sigmoid()
-            )
-        self.apply(self._init_weights)
-
-    def _init_weights(self, m):
-        if isinstance(m, nn.Linear):
-            trunc_normal_(m.weight, std=.02)
-            if isinstance(m, nn.Linear) and m.bias is not None:
-                nn.init.constant_(m.bias, 0)
-        elif isinstance(m, nn.LayerNorm):
-            nn.init.constant_(m.bias, 0)
-            nn.init.constant_(m.weight, 1.0)
-
-    def forward(self, xyz, timesteps=None):
-        bs, _, _ = xyz.size()
-        coor, f, normal, batch = self.grouper(xyz, self.num_centers)
-        pe = self.pos_embed(coor)
-        x = self.input_proj(f)
-        
-        # 多尺度特征提取
-        if self.use_diffusion:
-            x = self.multi_scale_extractor(x)
-        
-        x = self.encoder(x + pe, coor)
-        
-        # 从点代理到平面代理
-        normal_embed = self.plane_embed(normal)
-        x = torch.cat([x, normal_embed], dim=-1)
-        plane_encoder = torch.zeros(bs, self.num_planes, x.size(-1)).cuda()
-        for i in range(bs):
-            unique_batch = torch.unique(batch[i])
-            for j, ub in enumerate(unique_batch):
-                plane_encoder[i][j] = x[i][(batch[i] == ub).squeeze()].sum(dim=0)
-        x = self.plane_mlp(plane_encoder)
-        global_feature = self.increase_dim(x)
-        global_feature = torch.max(global_feature, dim=1)[0]
-        mem = self.mem_link(x)
-        
-        f_plane = torch.zeros(bs, self.num_planes, normal_embed.size(-1)).cuda()
-        for i in range(bs):
-            unique_batch = torch.unique(batch[i])
-            f_plane[i][:unique_batch.shape[0]] = x[i][:unique_batch.shape[0]]
-            
-        if self.query_type == 'dynamic':
-            plane = self.plane_pred_coarse(global_feature).reshape(bs, -1, 3)
-            q = self.mlp_query(
-                torch.cat([
-                    global_feature.unsqueeze(1).expand(-1, plane.size(1), -1),
-                    plane], dim=-1))
-            if self.query_ranking:
-                f_plane = self.plane_mlp2(f_plane)
-                q = torch.cat([q, f_plane], dim=1)
-                query_ranking = self.query_ranking(q)
-                idx = torch.argsort(query_ranking, dim=1)
-                q = torch.gather(q, 1, idx[:, :self.num_queries].expand(-1, -1, q.size(-1)))
-                
-            # 使用扩散解码器或传统解码器
-            if self.use_diffusion:
-                q = self.diffusion_decoder(q, plane, timesteps, self.training_diffusion)
-            else:
-                q = self.decoder(q=q, v=mem, q_pos=None, v_pos=None, denoise_length=0)
-                
-            plane = self.plane_pred(q).reshape(bs, -1, 3)
-        elif self.query_type == 'static':
-            q = self.mlp_query.weight
-            q = q.unsqueeze(0).expand(bs, -1, -1)
-            
-            # 使用扩散解码器或传统解码器
-            if self.use_diffusion:
-                zero_pos = torch.zeros(bs, q.size(1), 3, device=q.device)
-                q = self.diffusion_decoder(q, zero_pos, timesteps, self.training_diffusion)
-            else:
-                q = self.decoder(q=q, v=mem, q_pos=None, v_pos=None, denoise_length=0)
-                
-            plane = self.plane_pred(q).reshape(bs, -1, 3)
-        return q, plane
-
-
 
 @MODELS.register_module()
-class PaCoDiT(nn.Module):
+class PaCo(nn.Module):
     """
-    Enhanced PaCo Model with Diffusion Transformer integration
-    
-    This model integrates lightweight Diffusion Transformer (DiT) with multi-scale tokens
-    and two-stage diffusion process while maintaining the original output format.
+    PaCo Model
+
+    This model combines point cloud transformer encoding/decoding with a folding-based
+    reconstruction head and additional classifier for plane predictions.
     """
 
     def __init__(self, config, **kwargs):
@@ -1337,19 +1372,8 @@ class PaCoDiT(nn.Module):
         self.num_points = getattr(config, 'num_points', None)
         self.decoder_type = config.decoder_type
         self.fold_step = 8
-        
-        # 使用增强版Transformer
-        self.base_model = EnhancedPCTransformer(config)
+        self.base_model = PCTransformer(config)
         self.repulsion = config.repulsion
-        
-        # 扩散相关配置
-        self.use_diffusion = getattr(config, 'use_diffusion', True)
-        self.diffusion_loss_weight = getattr(config, 'diffusion_loss_weight', 1.0)
-        
-        if self.use_diffusion:
-            self.noise_scheduler = NoiseScheduler(
-                num_timesteps=getattr(config, 'num_diffusion_steps', 1000)
-            )
 
         if self.decoder_type == 'fold':
             self.factor = self.fold_step ** 2
@@ -1372,7 +1396,7 @@ class PaCoDiT(nn.Module):
 
         self.increase_dim = nn.Sequential(
             nn.Conv1d(self.trans_dim, 1024, 1),
-            LayerNorm1d(1024),
+            nn.BatchNorm1d(1024),
             nn.LeakyReLU(negative_slope=0.2),
             nn.Conv1d(1024, 1024, 1)
         )
@@ -1382,10 +1406,10 @@ class PaCoDiT(nn.Module):
 
         self.rebuild_map = nn.Sequential(
             nn.Conv1d(self.trans_dim, hidden_dim, 1),
-            LayerNorm1d(hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
             nn.ReLU(inplace=True),
             nn.Conv1d(hidden_dim, hidden_dim // 2, 1),
-            LayerNorm1d(hidden_dim // 2),
+            nn.BatchNorm1d(hidden_dim // 2),
             nn.ReLU(inplace=True),
         )
         self.classifier = nn.Linear(hidden_dim // 2, 2)
@@ -1399,57 +1423,21 @@ class PaCoDiT(nn.Module):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
 
-    def get_diffusion_loss(self, ret, gt_points, timesteps):
-        """计算扩散损失 - 基于噪声预测的SNR-weighted MSE损失"""
-        if not self.use_diffusion:
-            return {}
-        
-        try:
-            predicted_points = ret[1]  # 重建的点云（x0 预测）
-
-            # 确保噪声调度器在正确的设备上
-            device = gt_points.device
-            if not hasattr(self.noise_scheduler, '_device') or self.noise_scheduler._device != device:
-                self.noise_scheduler.to(device)
-            
-            # 添加噪声到目标点云
-            noise = torch.randn_like(gt_points)
-            noisy_gt = self.noise_scheduler.add_noise(gt_points, noise, timesteps)
-
-            # 根据模型输出的 x0 预测计算噪声预测
-            sqrt_alpha = self.noise_scheduler.sqrt_alphas_cumprod[timesteps].view(-1, 1, 1)
-            sqrt_one_minus_alpha = self.noise_scheduler.sqrt_one_minus_alphas_cumprod[timesteps].view(-1, 1, 1)
-            predicted_noise = (noisy_gt - sqrt_alpha * predicted_points) / sqrt_one_minus_alpha
-
-            # 计算SNR-weighted MSE损失 (per-sample)
-            mse_loss = F.mse_loss(predicted_noise, noise, reduction='none')  # [B, N, 3]
-            mse_loss = mse_loss.mean(dim=[1, 2])  # [B] - 每个样本的平均MSE
-            
-            # 获取SNR权重 (使用snr^0.5权重，并detach以防止梯度回传)
-            snr_weights = self.noise_scheduler.get_snr_weights(
-                timesteps, 
-                use_sqrt=True,  # 使用snr^0.5权重
-                detach_weights=True  # detach权重防止梯度回传
-            )  # [B]
-            
-            # 应用SNR权重
-            weighted_loss = snr_weights * mse_loss  # [B]
-            diffusion_loss = weighted_loss.mean()  # 标量
-            
-            diffusion_loss = diffusion_loss * self.diffusion_loss_weight
-            return {
-                'diffusion_loss': diffusion_loss
-            }
-        except Exception as e:
-            print(f"警告：扩散损失计算失败: {e}")
-            # 如果扩散损失计算失败，返回零损失
-            return {
-                'diffusion_loss': torch.tensor(0.0, device=gt_points.device, requires_grad=True)
-            }
-
     def get_loss(self, config, ret, class_prob, gt, gt_index, plane, plan_index):
         """
-        Enhanced loss computation with diffusion losses - 修复版本
+        Compute losses for the model
+
+        Args:
+            config: Configuration with loss weights
+            ret: Tuple of (predicted_planes, reconstructed_points)
+            class_prob: Classification probabilities tensor
+            gt: Ground truth point clouds
+            gt_index: Ground truth indices
+            plane: Predicted plane parameters
+            plan_index: Predicted plane indices
+
+        Returns:
+            Dictionary of computed losses
         """
         from pytorch3d.structures import Pointclouds
         from pytorch3d.loss import chamfer_distance
@@ -1460,33 +1448,21 @@ class PaCoDiT(nn.Module):
 
         device = reconstructed_points.device
         losses = {
-            "plane_chamfer_loss": torch.tensor(0.0, device=device),
-            "classification_loss": torch.tensor(0.0, device=device),
-            "chamfer_norm1_loss": torch.tensor(0.0, device=device),
-            "chamfer_norm2_loss": torch.tensor(0.0, device=device),
-            "plane_normal_loss": torch.tensor(0.0, device=device),
-            "repulsion_loss": torch.tensor(0.0, device=device),
-            "diffusion_loss": torch.tensor(0.0, device=device),
+            "plane_chamfer_loss": 0.0,
+            "classification_loss": 0.0,
+            "chamfer_norm1_loss": 0.0,
+            "chamfer_norm2_loss": 0.0,
+            "plane_normal_loss": 0.0,
+            "repulsion_loss": 0.0
         }
-        
-        # 添加扩散损失 - 确保在训练模式下且有有效数据时才计算
-        if self.use_diffusion and self.training and gt is not None:
-            try:
-                timesteps = self.noise_scheduler.sample_timesteps(batch_size, device)
-                diffusion_losses = self.get_diffusion_loss(ret, gt, timesteps)
-                losses.update(diffusion_losses)
-            except Exception as e:
-                print(f"警告：跳过扩散损失计算: {e}")
-        
-        # ... 保持原有的损失计算逻辑不变 ...
         size_total = 0.0
 
         for batch_idx in range(batch_size):
             unique_gt_indices = torch.unique(gt_index[batch_idx].int())
-            unique_gt_indices = unique_gt_indices[unique_gt_indices != -1]
+            unique_gt_indices = unique_gt_indices[unique_gt_indices != -1]  # Remove invalid indices
             num_ground_truth_planes = unique_gt_indices.size(0)
 
-            # 计算真实点云
+            # Compute ground truth point clouds
             ground_truth_pointclouds = [
                 gt[batch_idx, (gt_index[batch_idx] == idx)].reshape(-1, 3)
                 for idx in unique_gt_indices
@@ -1494,7 +1470,7 @@ class PaCoDiT(nn.Module):
             ground_truth_pointclouds = ground_truth_pointclouds * self.num_queries
             ground_truth_pointclouds = Pointclouds(ground_truth_pointclouds).to(device)
 
-            # 计算重建点云
+            # Compute reconstructed point clouds
             start_indices = torch.arange(self.num_queries, device=device) * self.factor
             end_indices = start_indices + self.factor
             reconstructed_pointclouds = [
@@ -1506,14 +1482,14 @@ class PaCoDiT(nn.Module):
             ]
             reconstructed_pointclouds = Pointclouds(reconstructed_pointclouds).to(device)
 
-            # 计算Chamfer距离
+            # Compute Chamfer Distance between ground truth and reconstructed point clouds
             chamfer_distances, _ = chamfer_distance(
                 ground_truth_pointclouds, reconstructed_pointclouds,
                 point_reduction='mean', batch_reduction=None
             )
             plane_chamfer_distance = chamfer_distances.view(self.num_queries, num_ground_truth_planes)
 
-            # 计算平面法向量损失
+            # Compute Plane Normal Loss
             gt_planes = plane[batch_idx, unique_gt_indices].float()
             pred_planes = predicted_planes[batch_idx]
             l2_loss = torch.sum((pred_planes[:, :3].unsqueeze(1) - gt_planes[:, :3].unsqueeze(0)) ** 2, dim=-1)
@@ -1522,7 +1498,7 @@ class PaCoDiT(nn.Module):
             )
             plane_normal_loss = (l2_loss + cosine_loss).view(self.num_queries, num_ground_truth_planes)
 
-            # 计算分类损失
+            # Compute Classification Loss
             classification_scores = class_prob[batch_idx]
             object_class_loss = F.cross_entropy(
                 classification_scores,
@@ -1535,7 +1511,7 @@ class PaCoDiT(nn.Module):
                 size_average=False, reduce=False
             ).unsqueeze(-1).expand(-1, num_ground_truth_planes)
 
-            # 计算排斥损失
+            # Calculate repulsion loss for each batch
             reshaped_reconstructed_points = reconstructed_points[batch_idx].view(-1, self.factor, 3)
             neighbor_indices = knn_point(
                 self.repulsion.num_neighbors, reshaped_reconstructed_points, reshaped_reconstructed_points
@@ -1550,7 +1526,7 @@ class PaCoDiT(nn.Module):
                 dim=(1, 2)
             ).clamp(min=0).unsqueeze(-1).expand(-1, num_ground_truth_planes)
 
-            # 匈牙利分配
+            # Hungarian Assignment for matching predictions with ground truth
             cost_matrix = (
                     object_class_loss +
                     plane_chamfer_distance * config.plane_chamfer_loss_weight +
@@ -1562,85 +1538,64 @@ class PaCoDiT(nn.Module):
                 torch.tensor(a, dtype=torch.long, device=device) for a in hungarian_assignment
             ]
 
-            # 提取匹配损失
+            # Extract Matched Losses
             matched_plane_chamfer_distance = plane_chamfer_distance[hungarian_assignment[0], hungarian_assignment[1]]
             matched_plane_normal_loss = plane_normal_loss[hungarian_assignment[0], hungarian_assignment[1]]
             matched_repulsion_penalty = repulsion_penalty[hungarian_assignment[0], 0]
             matched_reconstructed_points = reshaped_reconstructed_points[hungarian_assignment[0]].reshape(1, -1, 3)
             matched_object_class_loss = object_class_loss[hungarian_assignment[0], 0]
 
-            # 计算未匹配分类损失
+            # Compute Unmatched Classification Loss
             unmatched_indices = torch.tensor(
                 list(set(range(self.num_queries)) - set(hungarian_assignment[0].tolist())),
                 device=device
             )
-            if len(unmatched_indices) > 0:
-                unmatched_class_loss = non_object_class_loss[unmatched_indices, 0] * config.non_obj_class_loss_weight
-                total_classification_loss = torch.cat([matched_object_class_loss, unmatched_class_loss])
-            else:
-                total_classification_loss = matched_object_class_loss
+            unmatched_class_loss = non_object_class_loss[unmatched_indices, 0] * config.non_obj_class_loss_weight
+            total_classification_loss = torch.cat([matched_object_class_loss, unmatched_class_loss])
 
-            # 计算精细Chamfer损失
+            # Compute Fine-Grained Chamfer Loss
             fine_chamfer_loss_1 = chamfer_distance(
                 matched_reconstructed_points, gt[batch_idx].unsqueeze(0), norm=1
             )
             fine_chamfer_loss_2 = chamfer_distance(
                 matched_reconstructed_points, gt[batch_idx].unsqueeze(0)
             )
-    
-            losses["plane_chamfer_loss"] = losses["plane_chamfer_loss"] + matched_plane_chamfer_distance.sum()
-            losses["classification_loss"] = losses["classification_loss"] + total_classification_loss.sum()
-            losses["plane_normal_loss"] = losses["plane_normal_loss"] + matched_plane_normal_loss.sum()
-            losses["repulsion_loss"] = losses["repulsion_loss"] + matched_repulsion_penalty.sum()
-            losses["chamfer_norm1_loss"] = losses["chamfer_norm1_loss"] + fine_chamfer_loss_1[0]
-            losses["chamfer_norm2_loss"] = losses["chamfer_norm2_loss"] + fine_chamfer_loss_2[0]
+
+            losses["plane_chamfer_loss"] += matched_plane_chamfer_distance.sum()
+            losses["classification_loss"] += total_classification_loss.sum()
+            losses["plane_normal_loss"] += matched_plane_normal_loss.sum()
+            losses["repulsion_loss"] += matched_repulsion_penalty.sum()
+            losses["chamfer_norm1_loss"] += fine_chamfer_loss_1[0]
+            losses["chamfer_norm2_loss"] += fine_chamfer_loss_2[0]
             size_total += num_ground_truth_planes
 
+        for k in losses.keys():
+            if k.startswith('chamfer'):
+                losses[k] /= batch_size
+            else:
+                losses[k] /= size_total
 
-        # 标准化损失 - 使用除法而不是原地操作
-        if size_total > 0:
-            for k in losses.keys():
-                if k.startswith('chamfer') or k.startswith('diffusion'):
-                    losses[k] = losses[k] / batch_size
-                else:
-                    losses[k] = losses[k] / size_total
-    
-        # 计算总损失
-        total_loss = (
+        losses["total_loss"] = (
                 losses["classification_loss"] +
                 config.plane_chamfer_loss_weight * losses["plane_chamfer_loss"] +
                 config.plane_normal_loss_weight * losses["plane_normal_loss"] +
                 config.repulsion_loss_weight * losses["repulsion_loss"] +
                 config.chamfer_norm2_loss_weight * losses["chamfer_norm2_loss"]
         )
-    
-        # 添加扩散损失
-        if 'diffusion_loss' in losses:
-            total_loss = total_loss + losses['diffusion_loss']
-        
-        losses["total_loss"] = total_loss
 
-        return losses       
+        return losses
 
     def forward(self, xyz):
         """
-        Forward pass maintaining original output format: ret, class_prob
+        Forward pass for the model
+
+        Args:
+            xyz: Input point cloud tensor
+
+        Returns:
+            Tuple of (predicted plane parameters, reconstructed points) and class probabilities
         """
-        # 在训练时使用随机时间步，推理时使用None
-        timesteps = None
-        if self.use_diffusion and self.training:
-            batch_size = xyz.size(0)
-            device = xyz.device
-            # 确保噪声调度器在正确的设备上
-            if not hasattr(self.noise_scheduler, '_device') or self.noise_scheduler._device != device:
-                self.noise_scheduler.to(device)
-            timesteps = self.noise_scheduler.sample_timesteps(batch_size, device)
-        
-        # 设置diffusion training模式
-        if hasattr(self.base_model, 'training_diffusion'):
-            self.base_model.training_diffusion = self.training
-        
-        q, plane = self.base_model(xyz, timesteps)  # B M C and B M 3
+        q, plane = self.base_model(xyz)  # B M C and B M 3
         B, M, C = q.shape
         global_feature = self.increase_dim(q.transpose(1, 2)).transpose(1, 2)  # B M 1024
         global_feature = torch.max(global_feature, dim=1)[0]  # B 1024
@@ -1664,7 +1619,7 @@ class PaCoDiT(nn.Module):
 
         rebuild_feature = self.rebuild_map(rebuild_feature.reshape(B * M, -1).unsqueeze(-1))
 
-        # 生成平面
+        # Generate the plane
         theta = plane[:, :, 0].unsqueeze(-1).expand(-1, M, theta_point.size(2))
         phi = plane[:, :, 1].unsqueeze(-1).expand(-1, M, theta_point.size(2))
         r = plane[:, :, 2].unsqueeze(-1).expand(-1, M, theta_point.size(2))
@@ -1674,7 +1629,7 @@ class PaCoDiT(nn.Module):
         N = torch.clamp(N, min=1e-6)
         r2 = r / N
 
-        # 点云生成
+        # Point cloud generation
         x_coord = (r2 * torch.sin(theta_point) * torch.cos(phi_point)).unsqueeze(-1)
         y_coord = (r2 * torch.sin(theta_point) * torch.sin(phi_point)).unsqueeze(-1)
         z_coord = (r2 * torch.cos(theta_point)).unsqueeze(-1)

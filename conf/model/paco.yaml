@@ -6,7 +6,7 @@ num_centers: [128, 128]
 group_k: 32
 global_feature_dim: 1024
 
-encoder_type: graph
+encoder_type: learnable
 decoder_type: fc
 query_type: dynamic
 query_ranking: true

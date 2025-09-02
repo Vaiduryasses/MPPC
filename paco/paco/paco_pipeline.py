@@ -13,6 +13,7 @@ from .transformer_utils import (
     ImprovedDeformableLocalGraphAttention, CrossAttention,
     knn_point, index_points
 )
+from .learnable_grouper import LearnableQueryGrouper
 
 from .diffusion_utils import (
     TwoStageDiffusionModule, MultiScaleTokenExtractor, NoiseScheduler
@@ -972,8 +973,18 @@ class PCTransformer(nn.Module):
                 nn.Linear(encoder.embed_dim * 2, encoder.embed_dim),
                 nn.GELU()
             )
+        elif self.encoder_type == 'learnable':
+            self.grouper = LearnableQueryGrouper(num_queries=self.num_planes)
+            self.plane_mlp = nn.Sequential(
+                nn.Linear(encoder.embed_dim * 2, encoder.embed_dim),
+                nn.GELU()
+            )
         else:
             self.grouper = SimpleEncoder(k=self.group_k, num_planes=self.num_planes)
+            self.plane_mlp = nn.Sequential(
+                nn.Linear(encoder.embed_dim * 2, encoder.embed_dim),
+                nn.GELU()
+            )
         self.pos_embed = nn.Sequential(
             nn.Linear(in_chans, 128),
             nn.GELU(),
@@ -1047,7 +1058,16 @@ class PCTransformer(nn.Module):
 
     def forward(self, xyz):
         bs, _, _ = xyz.size()
-        coor, f, normal, batch = self.grouper(xyz, self.num_centers)
+        grouper_out = self.grouper(xyz, self.num_centers)
+        coor, f, normal, batch = grouper_out[:4]
+        if len(grouper_out) > 4:
+            self.assignments = grouper_out[4]
+        else:
+            self.assignments = None
+        if len(grouper_out) > 5:
+            self.query_confidence = grouper_out[5]
+        else:
+            self.query_confidence = None
         pe = self.pos_embed(coor)
         x = self.input_proj(f)
         x = self.encoder(x + pe, coor)
@@ -1216,7 +1236,16 @@ class EnhancedPCTransformer(nn.Module):
 
     def forward(self, xyz, timesteps=None):
         bs, _, _ = xyz.size()
-        coor, f, normal, batch = self.grouper(xyz, self.num_centers)
+        grouper_out = self.grouper(xyz, self.num_centers)
+        coor, f, normal, batch = grouper_out[:4]
+        if len(grouper_out) > 4:
+            self.assignments = grouper_out[4]
+        else:
+            self.assignments = None
+        if len(grouper_out) > 5:
+            self.query_confidence = grouper_out[5]
+        else:
+            self.query_confidence = None
         pe = self.pos_embed(coor)
         x = self.input_proj(f)
         
